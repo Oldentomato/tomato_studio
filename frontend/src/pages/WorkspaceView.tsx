@@ -18,17 +18,18 @@ export default function WorkspaceView() {
 
   useEffect(() => {
     if (!id) return;
+    const workspaceId = id;
     let cancelled = false;
 
     async function openWorkspace() {
       setStarting(true);
       setError(null);
       try {
-        let current = await getWorkspace(id);
+        let current = await getWorkspace(workspaceId);
         if (cancelled) return;
         setWorkspace(current);
         if (current.status !== "running" || !current.url) {
-          current = await startWorkspace(id);
+          current = await startWorkspace(workspaceId);
           if (cancelled) return;
           setWorkspace(current);
         }
