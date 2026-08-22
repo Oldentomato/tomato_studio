@@ -2,13 +2,14 @@ import asyncio
 import json
 from contextlib import suppress
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
+from starlette.responses import RedirectResponse
 
 from ..db import SessionLocal, get_db
 from ..models import Workspace
 from ..schemas import WorkspaceCreate, WorkspaceOut
-from ..services import docker_ws
+from ..services import docker_ws, ide_proxy
 from ..services.agent import workspace_out
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
@@ -75,6 +76,39 @@ def heartbeat(workspace_id: str, db: Session = Depends(get_db)) -> WorkspaceOut:
 def delete_workspace(workspace_id: str, db: Session = Depends(get_db)) -> None:
     workspace = _get(db, workspace_id)
     docker_ws.delete_workspace(db, workspace)
+
+
+_IDE_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+
+@router.api_route("/{workspace_id}/ide", methods=_IDE_METHODS, include_in_schema=False)
+async def ide_root(request: Request, workspace_id: str, db: Session = Depends(get_db)):
+    if request.method == "GET" and request.url.query == "":
+        return RedirectResponse(url=f"/api/workspaces/{workspace_id}/ide/", status_code=307)
+    return await ide_proxy.proxy_http(request, db, workspace_id, "")
+
+
+@router.api_route("/{workspace_id}/ide/{path:path}", methods=_IDE_METHODS, include_in_schema=False)
+async def ide_path(request: Request, workspace_id: str, path: str, db: Session = Depends(get_db)):
+    return await ide_proxy.proxy_http(request, db, workspace_id, path)
+
+
+@router.websocket("/{workspace_id}/ide")
+async def ide_socket_root(websocket: WebSocket, workspace_id: str) -> None:
+    db = SessionLocal()
+    try:
+        await ide_proxy.proxy_ws(websocket, db, workspace_id, "")
+    finally:
+        db.close()
+
+
+@router.websocket("/{workspace_id}/ide/{path:path}")
+async def ide_socket_path(websocket: WebSocket, workspace_id: str, path: str) -> None:
+    db = SessionLocal()
+    try:
+        await ide_proxy.proxy_ws(websocket, db, workspace_id, path)
+    finally:
+        db.close()
 
 
 @router.websocket("/{workspace_id}/terminal")

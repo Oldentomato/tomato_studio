@@ -235,10 +235,12 @@ def new_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def public_url(port: int | None) -> str | None:
-    if not port:
+def public_url(workspace: Workspace) -> str | None:
+    if (workspace.kind or "vscode") != "vscode":
         return None
-    return f"http://{resolved_public_workspace_host()}:{port}"
+    if not workspace.host_port:
+        return None
+    return f"/api/workspaces/{workspace.id}/ide/"
 
 
 def ensure_network() -> None:
@@ -666,7 +668,9 @@ def _connect_aliases(container, aliases: list[str]) -> None:
 def _run_vscode_container(workspace: Workspace):
     ensure_image(workspace.id)
     client = docker_client()
-    trusted = settings.cors_origins or ["http://localhost:5173"]
+    trusted = list(settings.cors_origins or ["http://localhost:5173"])
+    if "*" not in trusted:
+        trusted.append("*")
     command = [
         "--auth",
         "none",
