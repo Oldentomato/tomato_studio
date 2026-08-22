@@ -27,6 +27,10 @@ export default function WorkspaceView() {
       try {
         let current = await getWorkspace(workspaceId);
         if (cancelled) return;
+        if ((current.kind ?? "vscode") === "container") {
+          navigate(`/term/${workspaceId}`, { replace: true });
+          return;
+        }
         setWorkspace(current);
         if (current.status !== "running" || !current.url) {
           current = await startWorkspace(workspaceId);
@@ -46,7 +50,7 @@ export default function WorkspaceView() {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, navigate]);
 
   useEffect(() => {
     if (!id || !workspace || workspace.status !== "running") return;
@@ -84,6 +88,9 @@ export default function WorkspaceView() {
             {starting ? "시작 중" : workspace?.status === "running" ? "실행 중" : workspace?.status ?? ""}
           </span>
         </div>
+        <button type="button" className="ghost" onClick={() => id && navigate(`/files/${id}`)} disabled={!workspace}>
+          파일
+        </button>
         <button type="button" className="ghost" onClick={onStop} disabled={!workspace || stopping}>
           중지하고 나가기
         </button>
@@ -105,7 +112,11 @@ export default function WorkspaceView() {
       ) : (
         <div className="workspace-message">
           <div className="pulse" />
-          <p>VS Code 컨테이너를 준비하고 있습니다. 처음이면 이미지 때문에 조금 걸릴 수 있습니다.</p>
+          <p>
+            {workspace?.kind === "web"
+              ? "웹 화면을 준비하고 있습니다. 처음이면 이미지 때문에 조금 걸릴 수 있습니다."
+              : "VS Code 컨테이너를 준비하고 있습니다. 처음이면 이미지 때문에 조금 걸릴 수 있습니다."}
+          </p>
         </div>
       )}
     </div>

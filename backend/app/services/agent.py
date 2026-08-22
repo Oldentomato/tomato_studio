@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from openai import OpenAI
@@ -9,17 +8,16 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import Conversation, Spec, Workspace, utcnow
-from ..schemas import ChatOut, DownloadOut, SpecOut, ToolTrace, WorkspaceOut
-from . import docker_ws, specs as spec_service, volume_files
+from ..schemas import ChatOut, SpecOut, ToolTrace, WorkspaceOut
+from . import docker_ws, specs as spec_service
 
 SYSTEM_PROMPT = """당신은 Tomato Studio의 개발 환경 에이전트입니다.
-사용자는 한국어로 개발 환경을 요청합니다. VS Code 워크스페이스와 일반 컨테이너를 구분합니다.
+사용자는 한국어로 개발 환경을 요청합니다. VS Code 워크스페이스, 일반 컨테이너, 웹 UI 컨테이너를 구분합니다.
 
 도구:
 1) write_spec: 요청을 사양서로 정리합니다. 구조화 필드와 마크다운 본문을 함께 채웁니다. 기존 사양서를 고칠 때는 spec_id를 넣습니다.
 2) update_container: 이미 있는 워크스페이스에 사양서를 적용하고 다시 시작합니다. 새 컨테이너를 추가로 만들지 않습니다.
 3) delete_container: 워크스페이스 id로 컨테이너와 볼륨을 삭제합니다.
-4) download_file: 워크스페이스 볼륨에서 파일을 꺼냅니다. 디렉터리 경로를 주면 목록을 돌려줍니다.
 
 원칙 (절대):
 - 컨테이너를 처음부터 만드는 도구는 없습니다. create_container를 호출하지 마세요.
@@ -27,18 +25,21 @@ SYSTEM_PROMPT = """당신은 Tomato Studio의 개발 환경 에이전트입니�
 - "만들어줘"라고 해도 사양서만 작성합니다. 새 컨테이너는 사용자가 사양서의 **컨테이너 만들기** 버튼을 누를 때만 생깁니다.
 - 예외: 사용자가 오류 난 카드를 고른 뒤 고쳐 달라고 하면 write_spec(spec_id=기존) 후 update_container(workspace_id=기존)를 호출하세요.
 - 답변은 짧고 한국어로. 사양서 내용을 채팅에 반복하지 말고 오른쪽 패널을 보라고 안내합니다.
-- kind: vscode 또는 container.
+- kind: vscode, container, web.
   - vscode: code-server IDE. pip/apt는 여기에만 설치합니다.
-  - container: 이미지를 그대로 실행하는 일반 컨테이너(DB, 캐시, 웹서버, 직접 만든 서비스 등). 같은 tomato-studio 네트워크에서 tomato-ws-<id> 로 접근합니다.
-- docker_image는 Docker Hub 이미지. 예: python:3.12-slim, ubuntu:24.04, postgres:16, nginx:alpine.
+  - container: 이미지를 그대로 실행하는 일반 컨테이너(DB, 캐시, 웹서버를 터미널로 쓰는 경우 등). 같은 tomato-studio 네트워크에서 tomato-ws-<id> 로 접근합니다. 열면 터미널입니다.
+  - web: 브라우저로 들어가는 HTTP 화면. 터미널이 아니라 스튜디오 안에서 웹 UI로 엽니다. 대시보드, 관리 콘솔, 노트북 UI, 정적/관리 웹앱 등 HTTP를 듣는 이미지에 씁니다.
+- docker_image는 Docker Hub 이미지. 예: python:3.12-slim, ubuntu:24.04, postgres:16, nginx:alpine, grafana/grafana:latest.
 - 메모리: 512m, 1g, 2g, 4g, 8g.
-- vscode일 때만 pip/apt를 채웁니다. container면 pip_packages와 apt_packages는 빈 배열.
-- 부가 요청(환경변수, 실행 인자, 비밀번호, 커스텀 프로세스 등)은 env와 command에 넣습니다. DB만이 아닙니다.
+- vscode일 때만 pip/apt를 채웁니다. container/web이면 pip_packages와 apt_packages는 빈 배열.
+- kind=web 이면 http_port를 반드시 채웁니다. 컨테이너 안에서 웹 서버가 듣는 포트입니다. 이미지마다 다릅니다. 모를 때만 흔한 기본값(80, 3000, 8080, 8888 등)을 쓰고, 알면 그 이미지의 실제 포트를 넣습니다.
+- 부가 요청(환경변수, 실행 인자, 비밀번호, 커스텀 프로세스, 베이스 패스 등)은 env와 command에 넣습니다. DB만이 아닙니다.
 - markdown 실행 절에는 실제로 쓸 docker run 명령을 `실행 명령`으로 보여줍니다.
+- 파일 올리기/받기는 도구가 없습니다. 사용자가 파일을 말하면 워크스페이스 카드의 **파일** 버튼을 안내하세요.
 - 이미 만든 사양서를 고칠 때는 반드시 spec_id를 넣습니다.
 
 """ + spec_service.SPEC_MARKDOWN_GUIDE + """
-- 삭제/다운로드 전에 현재 컨테이너 id를 확인합니다.
+- 삭제 전에 현재 컨테이너 id를 확인합니다.
 """
 
 TOOLS = [
@@ -70,8 +71,12 @@ TOOLS = [
                     "python_version": {"type": "string", "description": "예: 3.12. vscode일 때만 의미 있음"},
                     "kind": {
                         "type": "string",
-                        "enum": ["vscode", "container"],
-                        "description": "vscode=IDE, container=이미지를 그대로 실행하는 일반 컨테이너",
+                        "enum": ["vscode", "container", "web"],
+                        "description": "vscode=IDE, container=터미널로 여는 일반 컨테이너, web=브라우저 웹 UI",
+                    },
+                    "http_port": {
+                        "type": "integer",
+                        "description": "kind=web일 때 컨테이너 안 HTTP 리스닝 포트. 예: 3000, 80, 8888, 9090, 9000. 이미지 기본 포트에 맞출 것.",
                     },
                     "notes": {"type": "string", "description": "짧게 남을 주의점. markdown 메모 절과 맞춰도 됨"},
                     "markdown": {
@@ -126,28 +131,27 @@ TOOLS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "download_file",
-            "description": "컨테이너 볼륨에서 파일을 다운로드하거나, 폴더면 목록을 보여 줍니다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "workspace_id": {"type": "string"},
-                    "path": {
-                        "type": "string",
-                        "description": "프로젝트 루트 기준 상대 경로. 비우거나 . 이면 목록.",
-                    },
-                },
-                "required": ["workspace_id", "path"],
-            },
-        },
-    },
 ]
 
-NEGATIVE_SPEC_HINTS = ("삭제", "지워", "중지", "다운로드", "파일", "목록")
-POSITIVE_SPEC_HINTS = ("사양", "환경", "python", "pandas", "fastapi", "ubuntu", "debian", "postgres", "redis", "세팅", "셋업")
+NEGATIVE_SPEC_HINTS = ("삭제", "지워", "중지", "다운로드", "파일", "업로드")
+POSITIVE_SPEC_HINTS = (
+    "사양",
+    "환경",
+    "python",
+    "pandas",
+    "fastapi",
+    "ubuntu",
+    "debian",
+    "postgres",
+    "redis",
+    "세팅",
+    "셋업",
+    "웹",
+    "대시보드",
+    "grafana",
+    "jupyter",
+    "nginx",
+)
 REPAIR_HINTS = ("고쳐", "수정", "업데이트", "다시 만", "재시작", "반영해")
 
 
@@ -176,14 +180,17 @@ def workspace_out(workspace: Workspace, *, sync: bool = True) -> WorkspaceOut:
         apt_packages=apt_packages if isinstance(apt_packages, list) else [],
         docker_image=workspace.docker_image,
         kind=workspace.kind or "vscode",
+        http_port=workspace.http_port,
         hostname=f"tomato-ws-{workspace.id}",
         access=spec_service.service_access(
             workspace.docker_image or "",
             workspace.id,
             workspace.slug,
             spec_service.parse_env(getattr(workspace, "env_json", None)),
+            kind=workspace.kind or "vscode",
+            http_port=workspace.http_port,
         )
-        if (workspace.kind or "vscode") == "container"
+        if (workspace.kind or "vscode") in {"container", "web"}
         else None,
         logs=docker_ws.get_progress(workspace.id),
         created_at=workspace.created_at,
@@ -203,6 +210,7 @@ def spec_out(spec) -> SpecOut:
         pip_packages=data["pip_packages"],
         apt_packages=data["apt_packages"],
         kind=data.get("kind") or "vscode",
+        http_port=data.get("http_port"),
         access=data.get("access"),
         notes=data["notes"],
         markdown=data.get("markdown") or "",
@@ -322,7 +330,7 @@ def _force_write_spec_with_llm(
             "content": (
                 "방금 요청은 사양서 작성 의도입니다. 답변 텍스트 대신 반드시 write_spec 도구를 호출하세요. "
                 "name, summary, docker_image, memory, kind, pip_packages, apt_packages, markdown을 모두 채우세요. "
-                "markdown은 개요/실행/설치/접속/메모 템플릿. IDE면 kind=vscode, 그 외 이미지 그대로 실행이면 kind=container."
+                "markdown은 개요/실행/설치/접속/메모 템플릿. IDE면 kind=vscode, HTTP 웹 화면이면 kind=web+http_port, 그 외 이미지 그대로 실행이면 kind=container."
                 f"{extra_hint}"
             ),
         },
@@ -357,6 +365,7 @@ def create_from_spec(db: Session, spec_id: str) -> tuple[Workspace, Spec, bool]:
         if existing is not None:
             image_changed = existing.docker_image and existing.docker_image != spec.docker_image
             kind_changed = (existing.kind or "vscode") != (spec.kind or "vscode")
+            port_changed = (existing.http_port or None) != (spec.http_port or None)
             run_changed, env_changed = spec_service.run_config_changed(
                 spec.docker_image,
                 spec_service.parse_env(getattr(existing, "env_json", None)),
@@ -375,11 +384,12 @@ def create_from_spec(db: Session, spec_id: str) -> tuple[Workspace, Spec, bool]:
                 existing.memory_limit = spec.memory
                 existing.docker_image = spec.docker_image
                 existing.kind = spec.kind or "vscode"
+                existing.http_port = spec.http_port
                 existing.env_json = json.dumps(env, ensure_ascii=False)
                 existing.command_json = json.dumps(command, ensure_ascii=False)
                 db.add(existing)
                 db.commit()
-                if (spec.kind or "vscode") == "container" and run_changed:
+                if (spec.kind or "vscode") in {"container", "web"} and (run_changed or port_changed):
                     workspace = docker_ws.recreate_workspace(db, existing, reset_volume=env_changed)
                 else:
                     workspace = docker_ws.start_workspace(
@@ -400,6 +410,7 @@ def create_from_spec(db: Session, spec_id: str) -> tuple[Workspace, Spec, bool]:
         kind=spec.kind or "vscode",
         env_json=json.dumps(env, ensure_ascii=False),
         command_json=json.dumps(command, ensure_ascii=False),
+        http_port=spec.http_port,
     )
     spec_service.touch_spec_workspace(db, spec, workspace.id)
     workspace = docker_ws.start_workspace(
@@ -445,6 +456,7 @@ def _run_tool(
             spec_id=spec_id or None,
             env=args.get("env") if isinstance(args.get("env"), dict) else None,
             command=args.get("command") if isinstance(args.get("command"), list) else None,
+            http_port=args.get("http_port"),
         )
         payload = spec_service.spec_to_dict(spec)
         return payload, {"spec": spec}
@@ -485,47 +497,17 @@ def _run_tool(
         docker_ws.delete_workspace(db, workspace)
         return {"deleted": workspace_id, "name": name_label}, {"deleted_id": workspace_id}
 
-    if name == "download_file":
-        workspace_id = args.get("workspace_id") or ""
-        path = args.get("path") or ""
-        workspace = db.get(Workspace, workspace_id)
-        if workspace is None:
-            raise ValueError("컨테이너를 찾을 수 없습니다.")
-        rel = volume_files.safe_relpath(path)
-        if not rel or path.strip() in {".", "/", ""}:
-            listing = volume_files.list_paths(workspace.volume_name, rel)
-            return {"type": "listing", "path": rel or ".", "files": listing}, {}
-        try:
-            filename, payload = volume_files.get_bytes(workspace.volume_name, rel)
-        except FileNotFoundError:
-            listing = volume_files.list_paths(workspace.volume_name, rel)
-            return {
-                "type": "listing",
-                "path": rel,
-                "files": listing,
-                "error": "파일이 아니라 폴더이거나 경로를 찾지 못했습니다.",
-            }, {}
-        token = volume_files.save_download(filename, payload)
-        download = {
-            "filename": filename,
-            "url": f"/api/downloads/{token}",
-            "path": rel,
-        }
-        return {"type": "file", **download}, {"download": download}
-
     raise ValueError(f"알 수 없는 도구: {name}")
 
 
 def _to_chat_out(conversation_id: str, reply: str, artifacts: dict[str, Any], traces: list[ToolTrace]) -> ChatOut:
     spec_obj = artifacts.get("spec")
     workspace_obj = artifacts.get("workspace")
-    download_obj = artifacts.get("download")
     return ChatOut(
         conversation_id=conversation_id,
         reply=reply,
         spec=spec_out(spec_obj) if spec_obj is not None else None,
         workspace=workspace_out(workspace_obj) if workspace_obj is not None else None,
-        download=DownloadOut(**download_obj) if download_obj else None,
         tools=traces,
     )
 
@@ -587,8 +569,6 @@ def _chat_core(
                 emit("spec", spec_out(extra["spec"]).model_dump(mode="json"))
             if extra.get("workspace") is not None:
                 emit("workspace", workspace_out(extra["workspace"]).model_dump(mode="json"))
-            if extra.get("download") is not None:
-                emit("download", extra["download"])
         return trace
 
     def auto_update_if_needed() -> None:
@@ -776,8 +756,4 @@ def _trace_summary(name: str, result: dict[str, Any]) -> str:
         return f"컨테이너 {ws.get('id')} · {ws.get('status')}"
     if name == "delete_container":
         return f"삭제 {result.get('deleted')}"
-    if name == "download_file":
-        if result.get("type") == "file":
-            return f"다운로드 {result.get('filename')}"
-        return f"목록 {len(result.get('files') or [])}개"
     return name

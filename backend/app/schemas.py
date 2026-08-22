@@ -21,6 +21,7 @@ class WorkspaceOut(BaseModel):
     apt_packages: list[str] = []
     docker_image: str | None = None
     kind: str = "vscode"
+    http_port: int | None = None
     hostname: str | None = None
     access: dict | None = None
     logs: list[str] = []
@@ -40,6 +41,7 @@ class SpecOut(BaseModel):
     pip_packages: list[str]
     apt_packages: list[str] = []
     kind: str = "vscode"
+    http_port: int | None = None
     access: dict | None = None
     notes: str
     markdown: str = ""
@@ -59,10 +61,17 @@ class ToolTrace(BaseModel):
     summary: str
 
 
-class DownloadOut(BaseModel):
-    filename: str
-    url: str
+class FileEntryOut(BaseModel):
+    name: str
     path: str
+    is_dir: bool
+    size: int | None = None
+    mtime: int | None = None
+
+
+class FileListOut(BaseModel):
+    path: str
+    entries: list[FileEntryOut]
 
 
 class ChatOut(BaseModel):
@@ -70,5 +79,4 @@ class ChatOut(BaseModel):
     reply: str
     spec: SpecOut | None = None
     workspace: WorkspaceOut | None = None
-    download: DownloadOut | None = None
     tools: list[ToolTrace] = []

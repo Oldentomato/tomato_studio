@@ -236,11 +236,14 @@ def new_id() -> str:
 
 
 def public_url(workspace: Workspace) -> str | None:
-    if (workspace.kind or "vscode") != "vscode":
-        return None
+    kind = (workspace.kind or "vscode").strip().lower()
     if not workspace.host_port:
         return None
-    return f"/api/workspaces/{workspace.id}/ide/"
+    if kind == "vscode":
+        return f"/api/workspaces/{workspace.id}/ide/"
+    if kind == "web":
+        return f"/api/workspaces/{workspace.id}/ui/"
+    return None
 
 
 def ensure_network() -> None:
@@ -280,6 +283,7 @@ def create_workspace(
     kind: str = "vscode",
     env_json: str | None = None,
     command_json: str | None = None,
+    http_port: int | None = None,
 ) -> Workspace:
     from .volume_files import ensure_writable
 
@@ -312,6 +316,7 @@ def create_workspace(
         apt_packages=json.dumps(apt_packages or [], ensure_ascii=False),
         docker_image=docker_image,
         kind=resolved_kind,
+        http_port=http_port,
         env_json=env_json or "{}",
         command_json=command_json or "[]",
     )
@@ -330,13 +335,29 @@ def _container_status(container) -> str:
     return "stopped"
 
 
-def _host_port(container) -> int | None:
+def _host_port(container, workspace: Workspace | None = None) -> int | None:
     ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
-    bindings = ports.get("8080/tcp") or []
-    if not bindings:
-        return None
-    raw = bindings[0].get("HostPort")
-    return int(raw) if raw else None
+    preferred: list[str] = []
+    if workspace is not None:
+        kind = (workspace.kind or "vscode").strip().lower()
+        if kind == "vscode":
+            preferred.append("8080/tcp")
+        elif kind == "web":
+            port = int(workspace.http_port or 80)
+            preferred.append(f"{port}/tcp")
+    for key in preferred:
+        bindings = ports.get(key) or []
+        if bindings:
+            raw = bindings[0].get("HostPort")
+            if raw:
+                return int(raw)
+    for bindings in ports.values():
+        if not bindings:
+            continue
+        raw = bindings[0].get("HostPort")
+        if raw:
+            return int(raw)
+    return None
 
 
 def _get_container(workspace: Workspace):
@@ -369,7 +390,7 @@ def sync_from_docker(workspace: Workspace) -> Workspace:
         workspace.host_port = None
         return workspace
     workspace.container_id = container.id
-    workspace.host_port = _host_port(container)
+    workspace.host_port = _host_port(container, workspace)
     live = _container_status(container)
     if workspace.status == "starting":
         return workspace
@@ -410,7 +431,7 @@ def enforce_running_limit(db: Session, keep_id: str) -> None:
     running = [
         workspace
         for workspace in list_running(db)
-        if workspace.id != keep_id and _is_vscode(workspace)
+        if workspace.id != keep_id and _has_web_ui(workspace)
     ]
     running.sort(key=lambda item: item.last_accessed_at)
     overflow = len(running) + 1 - settings.max_running
@@ -431,7 +452,7 @@ def _wait_until_ready(port: int) -> None:
                     return
             except httpx.HTTPError:
                 time.sleep(0.6)
-    raise TimeoutError("code-server가 준비되지 않았습니다.")
+    raise TimeoutError("웹 화면이 준비되지 않았습니다.")
 
 
 def _json_package_list(raw: str | None) -> list[str]:
@@ -606,6 +627,14 @@ def _is_vscode(workspace: Workspace) -> bool:
     return _workspace_kind(workspace) == "vscode"
 
 
+def _is_web(workspace: Workspace) -> bool:
+    return _workspace_kind(workspace) == "web"
+
+
+def _has_web_ui(workspace: Workspace) -> bool:
+    return _workspace_kind(workspace) in {"vscode", "web"}
+
+
 VSCODE_DARK_SETTINGS = {
     "workbench.colorTheme": "Default Dark Modern",
     "workbench.preferredDarkColorTheme": "Default Dark Modern",
@@ -756,11 +785,60 @@ def _run_service_container(workspace: Workspace, *, keep_alive: bool | None = No
     return created
 
 
+def _run_web_container(workspace: Workspace):
+    from .specs import (
+        default_web_port,
+        parse_command,
+        parse_env,
+        web_compat_env,
+        web_ui_prefix,
+        web_volume_path,
+    )
+
+    image = (workspace.docker_image or "").strip() or "nginx:alpine"
+    ensure_image(workspace.id, image)
+    client = docker_client()
+    http_port = int(workspace.http_port or default_web_port(image))
+    prefix = web_ui_prefix(workspace.id)
+    user_env = parse_env(getattr(workspace, "env_json", None))
+    env = {**web_compat_env(image, prefix), **user_env}
+    command = parse_command(getattr(workspace, "command_json", None))
+    volume_path = web_volume_path(image)
+    add_progress(workspace.id, f"웹 UI 컨테이너 시작: tomato-ws-{workspace.id} ({image}:{http_port})")
+    run_kwargs = {
+        "name": f"tomato-ws-{workspace.id}",
+        "hostname": (workspace.slug or workspace.id)[:63],
+        "detach": True,
+        "network": NETWORK_NAME,
+        "mem_limit": workspace.memory_limit or settings.mem_limit,
+        "environment": env or None,
+        "ports": {f"{http_port}/tcp": (resolved_workspace_bind_ip(),)},
+        "volumes": {workspace.volume_name: {"bind": volume_path, "mode": "rw"}},
+        "labels": {
+            LABEL_STUDIO: "workspace",
+            LABEL_WORKSPACE_ID: workspace.id,
+            "tomato.kind": "web",
+        },
+        "restart_policy": {"Name": "no"},
+    }
+    if command:
+        add_progress(workspace.id, "실행 명령: " + " ".join(command))
+        run_kwargs["command"] = command
+    created = client.containers.run(image, **run_kwargs)
+    _connect_aliases(created, [workspace.slug, workspace.id])
+    add_progress(workspace.id, f"네트워크 호스트: tomato-ws-{workspace.id}")
+    add_progress(workspace.id, f"HTTP 포트: {http_port}")
+    add_progress(workspace.id, "컨테이너가 생성되었습니다")
+    return created
+
+
 def _run_container(workspace: Workspace):
     add_progress(workspace.id, "네트워크/이미지 확인")
     ensure_network()
     if _is_vscode(workspace):
         return _run_vscode_container(workspace)
+    if _is_web(workspace):
+        return _run_web_container(workspace)
     return _run_service_container(workspace)
 
 
@@ -769,7 +847,8 @@ def start_workspace(db: Session, workspace: Workspace, *, prepare_python: bool =
         db.refresh(workspace)
         sync_from_docker(workspace)
         vscode = _is_vscode(workspace)
-        if workspace.status == "running" and (not vscode or workspace.host_port):
+        web = _is_web(workspace)
+        if workspace.status == "running" and (not (vscode or web) or workspace.host_port):
             if vscode:
                 container = _get_container(workspace)
                 if container is not None:
@@ -801,7 +880,7 @@ def start_workspace(db: Session, workspace: Workspace, *, prepare_python: bool =
             container = _retry_ssh(_boot)
             workspace.container_id = container.id
             if vscode:
-                port = _host_port(container)
+                port = _host_port(container, workspace)
                 if not port:
                     raise RuntimeError("호스트 포트를 할당하지 못했습니다.")
                 add_progress(workspace.id, f"code-server 대기 중 (port {port})")
@@ -811,6 +890,14 @@ def start_workspace(db: Session, workspace: Workspace, *, prepare_python: bool =
                 add_progress(workspace.id, "Python 환경 구성 시작")
                 _prepare_python_env(workspace, container)
                 add_progress(workspace.id, "준비 완료")
+                workspace.host_port = port
+            elif web:
+                port = _host_port(container, workspace)
+                if not port:
+                    raise RuntimeError("호스트 포트를 할당하지 못했습니다.")
+                add_progress(workspace.id, f"웹 UI 대기 중 (port {port})")
+                _wait_until_ready(port)
+                add_progress(workspace.id, "웹 UI 준비됨")
                 workspace.host_port = port
             else:
                 try:
@@ -923,6 +1010,9 @@ def delete_workspace(db: Session, workspace: Workspace) -> None:
                 container.remove(force=True)
             except DockerException:
                 pass
+        from .volume_files import remove_helper
+
+        remove_helper(workspace.volume_name)
         try:
             docker_client().volumes.get(workspace.volume_name).remove(force=True)
         except (NotFound, DockerException):
@@ -937,7 +1027,7 @@ def reap_idle(db: Session) -> None:
         sync_from_docker(workspace)
         if workspace.status != "running":
             continue
-        if not _is_vscode(workspace):
+        if not _has_web_ui(workspace):
             continue
         last = workspace.last_accessed_at
         if last.tzinfo is None:

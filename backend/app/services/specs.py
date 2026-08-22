@@ -10,7 +10,12 @@ from ..models import Spec, utcnow
 from .docker_ws import new_id
 
 ALLOWED_MEMORY = {"512m", "1g", "2g", "4g", "8g"}
-ALLOWED_KINDS = {"vscode", "container"}
+ALLOWED_KINDS = {"vscode", "container", "web"}
+KIND_LABELS = {
+    "vscode": "VS Code",
+    "container": "일반 컨테이너",
+    "web": "웹 UI",
+}
 IMAGE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*(?:/[a-z0-9._-]+)*:[a-z0-9._-]+$")
 PIP_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,_-]+\])?(?:\s*(?:[=<>!~]=?|===)\s*[A-Za-z0-9._*+-]+)?$")
 APT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9+.-]*(?:=[A-Za-z0-9.+~:-]+)?$")
@@ -62,10 +67,18 @@ def spec_to_dict(spec: Spec) -> dict:
         "pip_packages": parse_packages(spec.pip_packages),
         "apt_packages": parse_packages(spec.apt_packages),
         "kind": spec.kind or "vscode",
+        "http_port": spec.http_port,
         "env": env,
         "command": parse_command(getattr(spec, "command_json", None)),
-        "access": service_access(spec.docker_image, spec.workspace_id, None, env)
-        if (spec.kind or "vscode") == "container"
+        "access": service_access(
+            spec.docker_image,
+            spec.workspace_id,
+            None,
+            env,
+            kind=spec.kind or "vscode",
+            http_port=spec.http_port,
+        )
+        if (spec.kind or "vscode") in {"container", "web"}
         else None,
         "notes": spec.notes,
         "markdown": resolved_markdown(spec),
@@ -100,12 +113,34 @@ def normalize_kind(kind: str | None, image: str | None = None) -> str:
         "plain": "container",
         "service": "container",
         "db": "container",
+        "web": "web",
+        "webui": "web",
+        "ui": "web",
+        "http": "web",
+        "dashboard": "web",
+        "browser": "web",
     }
     if value in aliases:
         return aliases[value]
     if value:
-        raise ValueError("종류는 vscode 또는 container 여야 합니다.")
+        raise ValueError("종류는 vscode, container, web 중 하나여야 합니다.")
+    if is_web_image(image or ""):
+        return "web"
     return "container" if is_service_image(image or "") else "vscode"
+
+
+def normalize_http_port(value: int | str | None, image: str | None = None, kind: str | None = None) -> int | None:
+    if (kind or "") != "web":
+        return None
+    if value is None or value == "":
+        return default_web_port(image or "")
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("HTTP 포트는 1–65535 사이 숫자여야 합니다.") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("HTTP 포트는 1–65535 사이 숫자여야 합니다.")
+    return port
 
 
 def normalize_memory(memory: str) -> str:
@@ -205,6 +240,159 @@ def is_service_image(image: str) -> bool:
     }
 
 
+# HTTP UI 이미지의 기본 리스닝 포트. 여기 없는 이미지도 http_port만 지정하면 된다.
+WEB_UI_PORTS = {
+    "grafana": 3000,
+    "grafana-oss": 3000,
+    "grafana-enterprise": 3000,
+    "jupyter": 8888,
+    "jupyter-notebook": 8888,
+    "notebook": 8888,
+    "base-notebook": 8888,
+    "minimal-notebook": 8888,
+    "scipy-notebook": 8888,
+    "datascience-notebook": 8888,
+    "pyspark-notebook": 8888,
+    "all-spark-notebook": 8888,
+    "r-notebook": 8888,
+    "julia-notebook": 8888,
+    "tensorflow-notebook": 8888,
+    "pytorch-notebook": 8888,
+    "portainer": 9000,
+    "portainer-ce": 9000,
+    "nginx": 80,
+    "httpd": 80,
+    "caddy": 80,
+    "phpmyadmin": 80,
+    "adminer": 8080,
+    "pgadmin4": 80,
+    "kibana": 5601,
+    "uptime-kuma": 3001,
+    "n8n": 5678,
+    "gitea": 3000,
+    "sonarqube": 9000,
+    "prometheus": 9090,
+    "alertmanager": 9093,
+    "dozzle": 8080,
+    "homarr": 7575,
+    "dashy": 8080,
+    "heimdall": 80,
+    "metabase": 3000,
+    "superset": 8088,
+    "redash": 5000,
+    "nocodb": 8080,
+    "appsmith": 80,
+    "directus": 8055,
+    "strapi": 1337,
+    "ghost": 2368,
+    "wordpress": 80,
+    "nextcloud": 80,
+    "filebrowser": 80,
+    "cloudcmd": 8000,
+    "it-tools": 80,
+    "changedetection": 5000,
+    "vault": 8200,
+    "consul": 8500,
+    "traefik": 8080,
+    "pgweb": 8081,
+    "redis-commander": 8081,
+    "mongo-express": 8081,
+    "rabbitmq": 15672,
+    "minio": 9001,
+    "neo4j": 7474,
+}
+
+WEB_UI_VOLUMES = {
+    "grafana": "/var/lib/grafana",
+    "grafana-oss": "/var/lib/grafana",
+    "grafana-enterprise": "/var/lib/grafana",
+    "portainer": "/data",
+    "portainer-ce": "/data",
+    "uptime-kuma": "/app/data",
+    "n8n": "/home/node/.n8n",
+    "gitea": "/data",
+    "prometheus": "/prometheus",
+    "metabase": "/metabase-data",
+    "nextcloud": "/var/www/html",
+    "wordpress": "/var/www/html",
+    "filebrowser": "/srv",
+    "pgadmin4": "/var/lib/pgadmin",
+}
+
+
+def is_web_image(image: str) -> bool:
+    name = image_basename(image)
+    if name in WEB_UI_PORTS:
+        return True
+    if name.endswith("-notebook") or "grafana" in name:
+        return True
+    return False
+
+
+def default_web_port(image: str) -> int:
+    name = image_basename(image)
+    if name in WEB_UI_PORTS:
+        return WEB_UI_PORTS[name]
+    if name.endswith("-notebook"):
+        return 8888
+    if "grafana" in name:
+        return 3000
+    return 80
+
+
+def web_volume_path(image: str) -> str:
+    name = image_basename(image)
+    if name in WEB_UI_VOLUMES:
+        return WEB_UI_VOLUMES[name]
+    if name.endswith("-notebook"):
+        return "/home/jovyan"
+    if "grafana" in name:
+        return "/var/lib/grafana"
+    return "/data"
+
+
+def web_ui_prefix(workspace_id: str | None) -> str:
+    ws = workspace_id or "<id>"
+    return f"/api/workspaces/{ws}/ui"
+
+
+def web_compat_env(image: str, prefix: str) -> dict[str, str]:
+    """서브패스 프록시 뒤에서 잘 동작하도록, 알려진 이미지에만 기본 env를 보탠다.
+
+    없는 이미지는 빈 dict. 사용자 env가 나중에 덮어쓴다.
+    """
+    name = image_basename(image)
+    root = prefix.rstrip("/") + "/"
+    if name in {"grafana", "grafana-oss", "grafana-enterprise"} or "grafana" in name:
+        return {
+            "GF_SERVER_ROOT_URL": root,
+            "GF_SERVER_SERVE_FROM_SUB_PATH": "true",
+            "GF_SECURITY_ALLOW_EMBEDDING": "true",
+        }
+    if name.endswith("-notebook") or name in {
+        "jupyter",
+        "jupyter-notebook",
+        "notebook",
+    }:
+        return {
+            "NB_PREFIX": prefix,
+            "JUPYTER_BASE_URL": prefix,
+            "JUPYTER_ENABLE_LAB": "yes",
+        }
+    if name == "kibana":
+        return {
+            "SERVER_BASEPATH": prefix,
+            "SERVER_REWRITEBASEPATH": "true",
+        }
+    if name == "n8n":
+        return {
+            "N8N_PATH": prefix,
+        }
+    if name in {"portainer", "portainer-ce"}:
+        return {}
+    return {}
+
+
 # bash/sh만 있고 데몬이 없어서 바로 종료되는 OS/언어 이미지
 KEEP_ALIVE_IMAGES = {
     "ubuntu",
@@ -231,7 +419,9 @@ def needs_keep_alive(image: str) -> bool:
     return image_basename(image) in KEEP_ALIVE_IMAGES
 
 
-def service_volume_path(image: str) -> str:
+def service_volume_path(image: str, kind: str | None = None) -> str:
+    if (kind or "") == "web":
+        return web_volume_path(image)
     return {
         "postgres": "/var/lib/postgresql/data",
         "postgresql": "/var/lib/postgresql/data",
@@ -340,6 +530,7 @@ def format_run_command(
     env: dict[str, str] | None = None,
     command: list[str] | None = None,
     workspace_id: str | None = None,
+    http_port: int | None = None,
 ) -> str:
     name = f"tomato-ws-{workspace_id}" if workspace_id else "tomato-ws-<id>"
     parts = [
@@ -353,6 +544,8 @@ def format_run_command(
         "--network",
         "tomato-studio",
     ]
+    if http_port:
+        parts.extend(["-p", str(http_port)])
     for key, value in (env or {}).items():
         parts.extend(["-e", f"{key}={value}"])
     parts.append(image)
@@ -369,6 +562,9 @@ def service_access(
     workspace_id: str | None,
     slug: str | None = None,
     env: dict[str, str] | None = None,
+    *,
+    kind: str | None = None,
+    http_port: int | None = None,
 ) -> dict | None:
     hostname = f"tomato-ws-{workspace_id}" if workspace_id else "tomato-ws-<id>"
     aliases = [hostname]
@@ -381,6 +577,13 @@ def service_access(
         "hostname": hostname,
         "aliases": aliases,
     }
+    if (kind or "") == "web":
+        port = http_port or default_web_port(image)
+        return {
+            **common,
+            "port": port,
+            "ui_path": web_ui_prefix(workspace_id) + "/",
+        }
     if name in {"postgres", "postgresql"}:
         return {
             **common,
@@ -422,9 +625,10 @@ SPEC_MARKDOWN_GUIDE = """마크다운 사양서 템플릿 (이 절 제목만 사
 한두 문장으로 무엇을 위한 환경인지.
 
 ## 실행
-- 종류: VS Code 또는 일반 컨테이너
+- 종류: VS Code 또는 일반 컨테이너 또는 웹 UI
 - 이미지: `이름:태그`
 - 메모리: 512m | 1g | 2g | 4g | 8g
+- HTTP 포트: 웹 UI일 때만. 컨테이너 안 리스닝 포트. 예: 3000, 80, 8888
 - 실행 명령: 부가 요청이 있으면 실제 쓸 `docker run ...` 한 줄. 없으면 생략.
 
 ## 설치
@@ -433,9 +637,10 @@ pip/apt가 있을 때만. 없으면 절 생략.
 - apt: `패키지`
 
 ## 접속
-다른 컨테이너에서 붙어야 할 때만. 없으면 절 생략.
+다른 컨테이너에서 붙거나 웹 화면을 열 때만. 없으면 절 생략.
 - 네트워크: tomato-studio
 - 호스트: tomato-ws-<id>
+- 웹 UI면 화면은 Tomato Studio에서 열고, HTTP 포트를 적기
 - 포트/계정/비밀번호는 알면 적기
 
 ## 메모
@@ -466,6 +671,7 @@ def build_spec_markdown(
     workspace_id: str | None = None,
     env: dict[str, str] | None = None,
     command: list[str] | None = None,
+    http_port: int | None = None,
 ) -> str:
     lines = [
         f"# {name}",
@@ -481,6 +687,7 @@ def build_spec_markdown(
             env=env,
             command=command,
             workspace_id=workspace_id,
+            http_port=http_port,
         ),
     ]
     pip_packages = pip_packages or []
@@ -491,8 +698,21 @@ def build_spec_markdown(
             lines.append("- pip: " + ", ".join(f"`{item}`" for item in pip_packages))
         if apt_packages:
             lines.append("- apt: " + ", ".join(f"`{item}`" for item in apt_packages))
-    if kind == "container":
-        lines += ["", "## 접속", *access_body(service_access(docker_image, workspace_id, env=env))]
+    if kind in {"container", "web"}:
+        lines += [
+            "",
+            "## 접속",
+            *access_body(
+                service_access(
+                    docker_image,
+                    workspace_id,
+                    env=env,
+                    kind=kind,
+                    http_port=http_port,
+                ),
+                kind=kind,
+            ),
+        ]
     if (notes or "").strip():
         lines += ["", "## 메모", notes.strip()]
     return "\n".join(lines)
@@ -519,26 +739,40 @@ def execution_body(
     env: dict[str, str] | None = None,
     command: list[str] | None = None,
     workspace_id: str | None = None,
+    http_port: int | None = None,
 ) -> list[str]:
-    kind_label = "VS Code" if kind == "vscode" else "일반 컨테이너"
+    kind_label = KIND_LABELS.get(kind, kind)
     lines = [
         f"- 종류: {kind_label}",
         f"- 이미지: `{docker_image}`",
         f"- 메모리: {memory}",
     ]
-    if kind == "container":
+    if kind == "web":
+        port = http_port or default_web_port(docker_image)
+        lines.append(f"- HTTP 포트: {port}")
+    if kind in {"container", "web"}:
         lines.append(
             "- 실행 명령: `"
-            + format_run_command(docker_image, env=env, command=command, workspace_id=workspace_id)
+            + format_run_command(
+                docker_image,
+                env=env,
+                command=command,
+                workspace_id=workspace_id,
+                http_port=http_port if kind == "web" else None,
+            )
             + "`"
         )
     return lines
 
 
-def access_body(access: dict | None) -> list[str]:
+def access_body(access: dict | None, kind: str | None = None) -> list[str]:
     if not access:
         return ["- 네트워크: `tomato-studio`"]
     lines = [f"- 네트워크: `{access.get('network', 'tomato-studio')}`"]
+    if (kind or "") == "web":
+        lines.append("- 화면: Tomato Studio에서 웹 UI로 열기")
+        if access.get("ui_path"):
+            lines.append(f"- 경로: `{access['ui_path']}`")
     if access.get("hostname"):
         lines.append(f"- 호스트: `{access['hostname']}`")
     if access.get("port"):
@@ -555,6 +789,8 @@ def access_body(access: dict | None) -> list[str]:
 def resolved_markdown(spec: Spec) -> str:
     env = resolved_env(spec)
     command = resolved_command(spec)
+    kind = spec.kind or "vscode"
+    http_port = spec.http_port
     text = (getattr(spec, "markdown", None) or "").strip()
     if not text:
         text = build_spec_markdown(
@@ -562,13 +798,14 @@ def resolved_markdown(spec: Spec) -> str:
             summary=spec.summary,
             docker_image=spec.docker_image,
             memory=spec.memory,
-            kind=spec.kind or "vscode",
+            kind=kind,
             pip_packages=parse_packages(spec.pip_packages),
             apt_packages=parse_packages(spec.apt_packages),
             notes=spec.notes or "",
             workspace_id=spec.workspace_id,
             env=env,
             command=command,
+            http_port=http_port,
         )
     else:
         text = replace_section(
@@ -577,20 +814,31 @@ def resolved_markdown(spec: Spec) -> str:
             execution_body(
                 docker_image=spec.docker_image,
                 memory=spec.memory,
-                kind=spec.kind or "vscode",
+                kind=kind,
                 env=env,
                 command=command,
                 workspace_id=spec.workspace_id,
+                http_port=http_port,
             ),
         )
-        if (spec.kind or "vscode") == "container":
+        if kind in {"container", "web"}:
             text = replace_section(
                 text,
                 "접속",
-                access_body(service_access(spec.docker_image, spec.workspace_id, env=env)),
+                access_body(
+                    service_access(
+                        spec.docker_image,
+                        spec.workspace_id,
+                        env=env,
+                        kind=kind,
+                        http_port=http_port,
+                    ),
+                    kind=kind,
+                ),
             )
     if spec.workspace_id:
         text = text.replace("tomato-ws-<id>", f"tomato-ws-{spec.workspace_id}")
+        text = text.replace("/workspaces/<id>/", f"/workspaces/{spec.workspace_id}/")
     return text
 
 
@@ -610,9 +858,11 @@ def write_spec(
     spec_id: str | None = None,
     env: dict | None = None,
     command: list[str] | str | None = None,
+    http_port: int | str | None = None,
 ) -> Spec:
     image = normalize_image(docker_image)
     resolved_kind = normalize_kind(kind, image)
+    resolved_port = normalize_http_port(http_port, image, resolved_kind)
     if resolved_kind == "vscode":
         pip = normalize_packages(pip_packages)
         apt = merge_apt_packages(normalize_apt_packages(apt_packages), pip)
@@ -639,8 +889,9 @@ def write_spec(
             workspace_id=workspace_id,
             env=merged_env,
             command=merged_command,
+            http_port=resolved_port,
         )
-    elif resolved_kind == "container":
+    elif resolved_kind in {"container", "web"}:
         body = replace_section(
             body,
             "실행",
@@ -651,12 +902,22 @@ def write_spec(
                 env=merged_env,
                 command=merged_command,
                 workspace_id=workspace_id,
+                http_port=resolved_port,
             ),
         )
         body = replace_section(
             body,
             "접속",
-            access_body(service_access(image, workspace_id, env=merged_env)),
+            access_body(
+                service_access(
+                    image,
+                    workspace_id,
+                    env=merged_env,
+                    kind=resolved_kind,
+                    http_port=resolved_port,
+                ),
+                kind=resolved_kind,
+            ),
         )
     env_text = json.dumps(merged_env, ensure_ascii=False)
     command_text = json.dumps(merged_command, ensure_ascii=False)
@@ -669,6 +930,7 @@ def write_spec(
         existing.pip_packages = json.dumps(pip, ensure_ascii=False)
         existing.apt_packages = json.dumps(apt, ensure_ascii=False)
         existing.kind = resolved_kind
+        existing.http_port = resolved_port
         existing.notes = note_text
         existing.markdown = body
         existing.env_json = env_text
@@ -687,6 +949,7 @@ def write_spec(
         pip_packages=json.dumps(pip, ensure_ascii=False),
         apt_packages=json.dumps(apt, ensure_ascii=False),
         kind=resolved_kind,
+        http_port=resolved_port,
         notes=note_text,
         markdown=body,
         env_json=env_text,

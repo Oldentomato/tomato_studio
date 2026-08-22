@@ -132,6 +132,7 @@ def migrate() -> None:
                 "apt_packages": "TEXT",
                 "docker_image": "VARCHAR(120)",
                 "kind": "VARCHAR(16) DEFAULT 'vscode'",
+                "http_port": "INTEGER",
                 "env_json": "TEXT",
                 "command_json": "TEXT",
             }
@@ -143,6 +144,7 @@ def migrate() -> None:
             spec_extras = {
                 "apt_packages": "TEXT",
                 "kind": "VARCHAR(16) DEFAULT 'vscode'",
+                "http_port": "INTEGER",
                 "markdown": "TEXT",
                 "env_json": "TEXT",
                 "command_json": "TEXT",

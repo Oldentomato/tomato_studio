@@ -2,14 +2,17 @@ import asyncio
 import json
 from contextlib import suppress
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+import posixpath
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
-from starlette.responses import RedirectResponse
+from starlette.responses import RedirectResponse, Response
 
 from ..db import SessionLocal, get_db
 from ..models import Workspace
-from ..schemas import WorkspaceCreate, WorkspaceOut
-from ..services import docker_ws, ide_proxy
+from ..schemas import FileListOut, WorkspaceCreate, WorkspaceOut
+from ..services import docker_ws, ide_proxy, volume_files
 from ..services.agent import workspace_out
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
@@ -78,6 +81,81 @@ def delete_workspace(workspace_id: str, db: Session = Depends(get_db)) -> None:
     docker_ws.delete_workspace(db, workspace)
 
 
+@router.get("/{workspace_id}/files", response_model=FileListOut)
+def list_files(workspace_id: str, path: str = "", db: Session = Depends(get_db)) -> FileListOut:
+    workspace = _get(db, workspace_id)
+    try:
+        rel = volume_files.safe_relpath(path)
+        entries = volume_files.list_entries(rel, workspace=workspace)
+    except volume_files.ContainerNotRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="경로를 찾을 수 없습니다.") from exc
+    except NotADirectoryError as exc:
+        raise HTTPException(status_code=400, detail="폴더가 아닙니다.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return FileListOut(path=rel, entries=entries)
+
+
+@router.get("/{workspace_id}/files/content")
+def download_workspace_file(workspace_id: str, path: str, db: Session = Depends(get_db)) -> Response:
+    workspace = _get(db, workspace_id)
+    try:
+        filename, payload = volume_files.get_bytes(path, workspace=workspace)
+    except volume_files.ContainerNotRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    quoted = quote(filename)
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.post("/{workspace_id}/files", response_model=FileListOut)
+async def upload_workspace_files(
+    workspace_id: str,
+    path: str = "",
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+) -> FileListOut:
+    workspace = _get(db, workspace_id)
+    try:
+        rel = volume_files.safe_relpath(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not files:
+        raise HTTPException(status_code=400, detail="올릴 파일이 없습니다.")
+    try:
+        payload_items: list[tuple[str, bytes]] = []
+        for item in files:
+            name = volume_files.safe_filename(item.filename)
+            payload = await item.read()
+            dest = posixpath.join(rel, name) if rel else name
+            payload_items.append((dest, payload))
+        volume_files.put_files(payload_items, workspace=workspace)
+        entries = volume_files.list_entries(rel, workspace=workspace)
+    except volume_files.ContainerNotRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return FileListOut(path=rel, entries=entries)
+
+
 _IDE_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
 
@@ -107,6 +185,36 @@ async def ide_socket_path(websocket: WebSocket, workspace_id: str, path: str) ->
     db = SessionLocal()
     try:
         await ide_proxy.proxy_ws(websocket, db, workspace_id, path)
+    finally:
+        db.close()
+
+
+@router.api_route("/{workspace_id}/ui", methods=_IDE_METHODS, include_in_schema=False)
+async def ui_root(request: Request, workspace_id: str, db: Session = Depends(get_db)):
+    if request.method == "GET" and request.url.query == "":
+        return RedirectResponse(url=f"/api/workspaces/{workspace_id}/ui/", status_code=307)
+    return await ide_proxy.proxy_http(request, db, workspace_id, "", mode="web")
+
+
+@router.api_route("/{workspace_id}/ui/{path:path}", methods=_IDE_METHODS, include_in_schema=False)
+async def ui_path(request: Request, workspace_id: str, path: str, db: Session = Depends(get_db)):
+    return await ide_proxy.proxy_http(request, db, workspace_id, path, mode="web")
+
+
+@router.websocket("/{workspace_id}/ui")
+async def ui_socket_root(websocket: WebSocket, workspace_id: str) -> None:
+    db = SessionLocal()
+    try:
+        await ide_proxy.proxy_ws(websocket, db, workspace_id, "", mode="web")
+    finally:
+        db.close()
+
+
+@router.websocket("/{workspace_id}/ui/{path:path}")
+async def ui_socket_path(websocket: WebSocket, workspace_id: str, path: str) -> None:
+    db = SessionLocal()
+    try:
+        await ide_proxy.proxy_ws(websocket, db, workspace_id, path, mode="web")
     finally:
         db.close()
 

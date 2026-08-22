@@ -13,7 +13,8 @@ export type Workspace = {
   pip_packages: string[];
   apt_packages: string[];
   docker_image: string | null;
-  kind?: "vscode" | "container";
+  kind?: "vscode" | "container" | "web";
+  http_port?: number | null;
   hostname?: string | null;
   access?: {
     network?: string;
@@ -23,6 +24,7 @@ export type Workspace = {
     user?: string;
     password?: string;
     database?: string;
+    ui_path?: string;
   } | null;
   logs: string[];
   created_at: string;
@@ -38,7 +40,8 @@ export type Spec = {
   python_version: string;
   pip_packages: string[];
   apt_packages: string[];
-  kind?: "vscode" | "container";
+  kind?: "vscode" | "container" | "web";
+  http_port?: number | null;
   access?: {
     network?: string;
     hostname?: string;
@@ -47,6 +50,7 @@ export type Spec = {
     user?: string;
     password?: string;
     database?: string;
+    ui_path?: string;
   } | null;
   notes: string;
   markdown?: string;
@@ -60,18 +64,11 @@ export type ToolTrace = {
   summary: string;
 };
 
-export type DownloadInfo = {
-  filename: string;
-  url: string;
-  path: string;
-};
-
 export type ChatOut = {
   conversation_id: string;
   reply: string;
   spec: Spec | null;
   workspace: Workspace | null;
-  download: DownloadInfo | null;
   tools: ToolTrace[];
 };
 
@@ -79,7 +76,19 @@ export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   tools?: ToolTrace[];
-  download?: DownloadInfo | null;
+};
+
+export type FileEntry = {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number | null;
+  mtime: number | null;
+};
+
+export type FileList = {
+  path: string;
+  entries: FileEntry[];
 };
 
 export type ChatStreamEvent =
@@ -89,7 +98,6 @@ export type ChatStreamEvent =
   | { type: "tool_result"; tool: ToolTrace }
   | { type: "spec"; spec: Spec }
   | { type: "workspace"; workspace: Workspace }
-  | { type: "download"; download: DownloadInfo }
   | { type: "done"; result: ChatOut }
   | { type: "error"; message: string };
 
@@ -151,6 +159,26 @@ export async function deleteWorkspace(id: string): Promise<void> {
 export function workspaceTerminalUrl(id: string): string {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/api/workspaces/${id}/terminal`;
+}
+
+export function workspaceFileUrl(id: string, path: string): string {
+  return `/api/workspaces/${id}/files/content?path=${encodeURIComponent(path)}`;
+}
+
+export async function listWorkspaceFiles(id: string, path = ""): Promise<FileList> {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  const response = await fetch(`/api/workspaces/${id}/files${qs}`);
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
+export async function uploadWorkspaceFiles(id: string, path: string, files: File[]): Promise<FileList> {
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  const response = await fetch(`/api/workspaces/${id}/files${qs}`, { method: "POST", body: form });
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
 }
 
 export async function listSpecs(): Promise<Spec[]> {
@@ -221,7 +249,6 @@ export async function sendChatStream(
     else if (eventName === "tool_result") onEvent({ type: "tool_result", tool: parsed as unknown as ToolTrace });
     else if (eventName === "spec") onEvent({ type: "spec", spec: parsed as unknown as Spec });
     else if (eventName === "workspace") onEvent({ type: "workspace", workspace: parsed as unknown as Workspace });
-    else if (eventName === "download") onEvent({ type: "download", download: parsed as unknown as DownloadInfo });
     else if (eventName === "error") onEvent({ type: "error", message: String(parsed.message ?? "알 수 없는 오류") });
     else if (eventName === "done") {
       finalResult = parsed as unknown as ChatOut;

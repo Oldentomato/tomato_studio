@@ -33,7 +33,7 @@ export default function TerminalView() {
       try {
         let current = await getWorkspace(workspaceId);
         if (cancelled) return;
-        if ((current.kind ?? "vscode") === "vscode") {
+        if ((current.kind ?? "vscode") !== "container") {
           navigate(`/ws/${workspaceId}`, { replace: true });
           return;
         }
@@ -192,6 +192,9 @@ export default function TerminalView() {
           </span>
         </div>
         <span className="slug">{workspace?.docker_image ?? ""}</span>
+        <button type="button" className="ghost" onClick={() => id && navigate(`/files/${id}`)} disabled={!workspace}>
+          파일
+        </button>
         <button type="button" className="ghost" onClick={onStop} disabled={!workspace || stopping}>
           중지하고 나가기
         </button>

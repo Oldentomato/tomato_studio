@@ -39,7 +39,13 @@ export default function SpecPanel({ spec, onCreated }: Props) {
       <div className="spec-head">
         <p className="eyebrow">environment spec</p>
         <p className="spec-meta">
-          {spec.kind === "container" ? "일반 컨테이너" : "VS Code"} · {spec.docker_image} · {spec.memory}
+          {spec.kind === "web"
+            ? "웹 UI"
+            : spec.kind === "container"
+              ? "일반 컨테이너"
+              : "VS Code"}{" "}
+          · {spec.docker_image} · {spec.memory}
+          {spec.kind === "web" && spec.http_port ? ` · :${spec.http_port}` : ""}
         </p>
       </div>
       <SpecMarkdown source={spec.markdown || spec.summary} />

@@ -96,8 +96,8 @@ export default function Studio() {
 
   async function onLaunch(event: MouseEvent, workspace: Workspace) {
     event.stopPropagation();
-    const isVscode = (workspace.kind ?? "vscode") === "vscode";
-    navigate(isVscode ? `/ws/${workspace.id}` : `/term/${workspace.id}`);
+    const kind = workspace.kind ?? "vscode";
+    navigate(kind === "container" ? `/term/${workspace.id}` : `/ws/${workspace.id}`);
   }
 
   async function onStop(event: MouseEvent, id: string) {
@@ -214,21 +214,24 @@ export default function Studio() {
             ) : (
               <ul className="grid">
                 {workspaces.map((workspace) => {
-                  const isVscode = (workspace.kind ?? "vscode") === "vscode";
+                  const kind = workspace.kind ?? "vscode";
+                  const isVscode = kind === "vscode";
+                  const isWeb = kind === "web";
                   const preparing = workspace.status === "starting" || workspace.status === "stopping";
                   const canLaunch =
                     (workspace.status === "running" || workspace.status === "stopped" || workspace.status === "error") &&
                     busyId !== workspace.id;
                   const actionsLocked = preparing || busyId === workspace.id;
+                  const kindLabel = isVscode ? "VS Code" : isWeb ? "웹 UI" : "컨테이너";
                   const launchLabel =
                     workspace.status === "starting"
                       ? "준비 중…"
                       : workspace.status === "stopping"
                         ? "중지 중…"
                         : workspace.status === "running"
-                          ? isVscode
-                            ? "열기"
-                            : "터미널"
+                          ? kind === "container"
+                            ? "터미널"
+                            : "열기"
                           : "시작";
                   return (
                   <li key={workspace.id}>
@@ -243,13 +246,14 @@ export default function Studio() {
                           {STATUS_LABEL[workspace.status]}
                         </span>
                         <span className="slug">
-                          {isVscode ? "VS Code" : "컨테이너"} · {workspace.memory_limit ?? "2g"}
+                          {kindLabel} · {workspace.memory_limit ?? "2g"}
                         </span>
                       </div>
                       <h2>{workspace.name}</h2>
                       <p className="hint">
                         {workspace.docker_image ?? "code-server"}
                         {!isVscode && workspace.hostname ? ` · ${workspace.hostname}` : ""}
+                        {isWeb && workspace.http_port ? ` · :${workspace.http_port}` : ""}
                         {workspace.pip_packages?.length ? ` · ${workspace.pip_packages.slice(0, 3).join(", ")}` : ""}
                         {workspace.apt_packages?.length ? ` · apt ${workspace.apt_packages.slice(0, 2).join(", ")}` : ""}
                       </p>
@@ -275,6 +279,17 @@ export default function Studio() {
                           }}
                         >
                           {launchLabel}
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost"
+                          disabled={busyId === workspace.id}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            navigate(`/files/${workspace.id}`);
+                          }}
+                        >
+                          파일
                         </button>
                         <button
                           type="button"

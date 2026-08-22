@@ -7,7 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .db import init_db
 from .routers.agent import router as agent_router
-from .routers.downloads import router as downloads_router
 from .routers.workspaces import router as workspaces_router
 from .services import docker_ws
 from .services.reaper import idle_reaper
@@ -45,7 +44,6 @@ app.add_middleware(
 )
 app.include_router(workspaces_router)
 app.include_router(agent_router)
-app.include_router(downloads_router)
 
 
 @app.get("/api/health")

@@ -54,7 +54,6 @@ export default function AgentChat({ onResult, onProgress, selectedWorkspace = nu
           }
           if (eventData.type === "spec") onProgress({ spec: eventData.spec });
           if (eventData.type === "workspace") onProgress({ workspace: eventData.workspace });
-          if (eventData.type === "download") onProgress({ download: eventData.download });
         },
         selectedWorkspace?.id,
       );
@@ -66,7 +65,6 @@ export default function AgentChat({ onResult, onProgress, selectedWorkspace = nu
           role: "assistant",
           content: result.reply,
           tools: result.tools,
-          download: result.download,
         },
       ]);
       onResult(result);
@@ -108,11 +106,6 @@ export default function AgentChat({ onResult, onProgress, selectedWorkspace = nu
                     </li>
                   ))}
                 </ul>
-              ) : null}
-              {item.download ? (
-                <a className="download-link" href={item.download.url}>
-                  {item.download.filename} 다운로드
-                </a>
               ) : null}
             </article>
           ))
