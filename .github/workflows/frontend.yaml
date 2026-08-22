@@ -25,7 +25,7 @@ concurrency:
 env:
   IMAGE_NAME: tomato-studio-web
   # GitOps: yq '.image.tag = env(IMAGE_TAG)' — values 구조 image.repository / image.tag 와 일치해야 함
-  GITOPS_VALUES_PATH: applications/tomato_studio/front/values.yaml
+  GITOPS_VALUES_PATH: applications/tomato-studio/front/values.yaml
 
 jobs:
   ci:
