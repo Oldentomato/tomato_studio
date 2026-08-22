@@ -44,6 +44,14 @@ def chat(payload: ChatIn, db: Session = Depends(get_db)) -> ChatOut:
 
 
 @router.post("/agent/chat/stream")
-def chat_stream(payload: ChatIn, db: Session = Depends(get_db)):
-    stream = agent.chat_stream(db, payload.message, payload.conversation_id, payload.workspace_id)
-    return StreamingResponse(stream, media_type="text/event-stream")
+def chat_stream(payload: ChatIn):
+    stream = agent.chat_stream(payload.message, payload.conversation_id, payload.workspace_id)
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

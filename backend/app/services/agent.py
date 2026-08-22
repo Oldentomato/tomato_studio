@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from typing import Any
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from ..config import settings
+from ..db import SessionLocal
 from ..models import Conversation, Spec, Workspace, utcnow
 from ..schemas import ChatOut, SpecOut, ToolTrace, WorkspaceOut
 from . import docker_ws, specs as spec_service
+
+SSE_PING_INTERVAL_SECONDS = 15.0
 
 SYSTEM_PROMPT = """당신은 Tomato Studio의 개발 환경 에이전트입니다.
 사용자는 한국어로 개발 환경을 요청합니다. VS Code 워크스페이스, 일반 컨테이너, 웹 UI 컨테이너를 구분합니다.
@@ -714,7 +719,6 @@ def chat(
 
 
 def chat_stream(
-    db: Session,
     message: str,
     conversation_id: str | None,
     workspace_id: str | None = None,
@@ -723,24 +727,40 @@ def chat_stream(
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
     def _generator():
-        emitted: list[str] = []
+        events: queue.Queue[str | None] = queue.Queue()
 
         def emit(event: str, data: dict[str, Any]) -> None:
-            emitted.append(_encode(event, data))
+            events.put(_encode(event, data))
 
-        try:
-            result = _chat_core(
-                db,
-                message,
-                conversation_id,
-                emit=emit,
-                workspace_id=workspace_id,
-            )
-            yield from emitted
-            yield _encode("done", result.model_dump(mode="json"))
-        except Exception as exc:
-            yield from emitted
-            yield _encode("error", {"message": str(exc)})
+        def run() -> None:
+            db = SessionLocal()
+            try:
+                result = _chat_core(
+                    db,
+                    message,
+                    conversation_id,
+                    emit=emit,
+                    workspace_id=workspace_id,
+                )
+                events.put(_encode("done", result.model_dump(mode="json")))
+            except Exception as exc:
+                events.put(_encode("error", {"message": str(exc)}))
+            finally:
+                db.close()
+                events.put(None)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        yield ": ping\n\n"
+        while True:
+            try:
+                item = events.get(timeout=SSE_PING_INTERVAL_SECONDS)
+            except queue.Empty:
+                yield ": ping\n\n"
+                continue
+            if item is None:
+                break
+            yield item
 
     return _generator()
 

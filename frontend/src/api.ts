@@ -249,8 +249,11 @@ export async function sendChatStream(
     else if (eventName === "tool_result") onEvent({ type: "tool_result", tool: parsed as unknown as ToolTrace });
     else if (eventName === "spec") onEvent({ type: "spec", spec: parsed as unknown as Spec });
     else if (eventName === "workspace") onEvent({ type: "workspace", workspace: parsed as unknown as Workspace });
-    else if (eventName === "error") onEvent({ type: "error", message: String(parsed.message ?? "알 수 없는 오류") });
-    else if (eventName === "done") {
+    else if (eventName === "error") {
+      const message = String(parsed.message ?? "알 수 없는 오류");
+      onEvent({ type: "error", message });
+      throw new Error(message);
+    } else if (eventName === "done") {
       finalResult = parsed as unknown as ChatOut;
       onEvent({ type: "done", result: finalResult });
     }
@@ -268,6 +271,8 @@ export async function sendChatStream(
       sep = buffer.indexOf("\n\n");
     }
   }
+  buffer += decoder.decode();
+  if (buffer.trim()) handleFrame(buffer.trim());
 
   if (!finalResult) throw new Error("스트림이 비정상 종료되었습니다.");
   return finalResult;
