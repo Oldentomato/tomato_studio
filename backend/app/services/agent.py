@@ -292,16 +292,75 @@ def _load_conversation(db: Session, conversation_id: str | None) -> Conversation
     return item
 
 
+HISTORY_LIMIT = 24
+
+
+def _tool_call_ids(message: dict[str, Any]) -> set[str]:
+    calls = message.get("tool_calls") or []
+    return {str(call.get("id")) for call in calls if call.get("id")}
+
+
+def _sanitize_history(messages: list[dict[str, Any]], *, limit: int = HISTORY_LIMIT) -> list[dict[str, Any]]:
+    """tool 메시지가 tool_calls 없는 assistant/system 뒤에 오지 않도록 맞춘다."""
+    kept: list[dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        role = msg.get("role")
+        if role == "tool":
+            i += 1
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            ids = _tool_call_ids(msg)
+            j = i + 1
+            tools: list[dict[str, Any]] = []
+            while j < n and messages[j].get("role") == "tool":
+                tools.append(messages[j])
+                j += 1
+            matched = [item for item in tools if item.get("tool_call_id") in ids]
+            if ids and len(matched) == len(ids):
+                kept.append(msg)
+                kept.extend(matched)
+            i = j
+            continue
+        if role in {"user", "assistant", "system"}:
+            kept.append(msg)
+        i += 1
+
+    if len(kept) <= limit:
+        return kept
+
+    start = len(kept) - limit
+    while start < len(kept) and kept[start].get("role") == "tool":
+        start += 1
+    trimmed = kept[start:]
+    if trimmed and trimmed[0].get("role") == "assistant" and trimmed[0].get("tool_calls"):
+        ids = _tool_call_ids(trimmed[0])
+        found: set[str] = set()
+        k = 1
+        while k < len(trimmed) and trimmed[k].get("role") == "tool":
+            found.add(str(trimmed[k].get("tool_call_id")))
+            k += 1
+        if not ids or not ids <= found:
+            trimmed = trimmed[k:]
+            while trimmed and trimmed[0].get("role") == "tool":
+                trimmed = trimmed[1:]
+    return trimmed
+
+
 def _messages(conversation: Conversation) -> list[dict[str, Any]]:
     try:
         data = json.loads(conversation.messages_json or "[]")
     except json.JSONDecodeError:
         data = []
-    return data[-24:]
+    if not isinstance(data, list):
+        return []
+    return _sanitize_history([item for item in data if isinstance(item, dict)])
 
 
 def _save_messages(db: Session, conversation: Conversation, messages: list[dict[str, Any]]) -> None:
-    conversation.messages_json = json.dumps(messages[-24:], ensure_ascii=False)
+    conversation.messages_json = json.dumps(_sanitize_history(messages), ensure_ascii=False)
     conversation.updated_at = utcnow()
     db.add(conversation)
     db.commit()
@@ -690,6 +749,7 @@ def _chat_core(
             auto_update_if_needed()
             if artifacts.get("workspace") is not None:
                 reply = "사양서를 반영해 컨테이너를 다시 적용했습니다. 오른쪽 카드 상태를 확인해 주세요."
+                history.append({"role": "assistant", "content": reply})
                 _save_messages(db, conversation, history)
                 return _to_chat_out(conversation.id, reply, artifacts, traces)
             if not repair:
@@ -697,13 +757,16 @@ def _chat_core(
                     "사양서를 작성했습니다. 오른쪽에서 Docker 이미지, 메모리, pip/apt 목록을 확인한 뒤 "
                     "**컨테이너 만들기** 버튼을 눌러 주세요."
                 )
+                history.append({"role": "assistant", "content": reply})
                 _save_messages(db, conversation, history)
                 return _to_chat_out(conversation.id, reply, artifacts, traces)
 
+    reply = "도구 호출이 너무 길어져 여기서 멈췄습니다. 이어서 말씀해 주세요."
+    history.append({"role": "assistant", "content": reply})
     _save_messages(db, conversation, history)
     return _to_chat_out(
         conversation.id,
-        "도구 호출이 너무 길어져 여기서 멈췄습니다. 이어서 말씀해 주세요.",
+        reply,
         artifacts,
         traces,
     )
