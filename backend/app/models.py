@@ -27,6 +27,8 @@ class Workspace(Base):
     apt_packages: Mapped[str | None] = mapped_column(Text, nullable=True)
     docker_image: Mapped[str | None] = mapped_column(String(120), nullable=True)
     kind: Mapped[str] = mapped_column(String(16), default="vscode")
+    env_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    command_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_accessed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -45,6 +47,8 @@ class Spec(Base):
     kind: Mapped[str] = mapped_column(String(16), default="vscode")
     notes: Mapped[str] = mapped_column(Text, default="")
     markdown: Mapped[str] = mapped_column(Text, default="")
+    env_json: Mapped[str] = mapped_column(Text, default="{}")
+    command_json: Mapped[str] = mapped_column(Text, default="[]")
     workspace_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

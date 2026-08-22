@@ -33,7 +33,9 @@ SYSTEM_PROMPT = """당신은 Tomato Studio의 개발 환경 에이전트입니�
 - docker_image는 Docker Hub 이미지. 예: python:3.12-slim, ubuntu:24.04, postgres:16, nginx:alpine.
 - 메모리: 512m, 1g, 2g, 4g, 8g.
 - vscode일 때만 pip/apt를 채웁니다. container면 pip_packages와 apt_packages는 빈 배열.
-- markdown은 아래 템플릿을 따르세요. 절을 마음대로 추가하지 마세요. 필요 없는 절은 생략하세요.
+- 부가 요청(환경변수, 실행 인자, 비밀번호, 커스텀 프로세스 등)은 env와 command에 넣습니다. DB만이 아닙니다.
+- markdown 실행 절에는 실제로 쓸 docker run 명령을 `실행 명령`으로 보여줍니다.
+- 이미 만든 사양서를 고칠 때는 반드시 spec_id를 넣습니다.
 
 """ + spec_service.SPEC_MARKDOWN_GUIDE + """
 - 삭제/다운로드 전에 현재 컨테이너 id를 확인합니다.
@@ -79,6 +81,16 @@ TOOLS = [
                     "spec_id": {
                         "type": "string",
                         "description": "기존 사양서를 수정할 때 그 id. 새 사양서를 만들 때는 비웁니다.",
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "컨테이너 환경변수. 예: POSTGRES_DB=studio, REDIS_PASSWORD=secret",
+                    },
+                    "command": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "이미지 기본 CMD 대신 쓸 실행 인자. 예: [\"redis-server\", \"--requirepass\", \"secret\"]",
                     },
                 },
                 "required": ["name", "summary", "docker_image", "memory", "kind", "pip_packages", "apt_packages", "markdown"],
@@ -165,7 +177,12 @@ def workspace_out(workspace: Workspace, *, sync: bool = True) -> WorkspaceOut:
         docker_image=workspace.docker_image,
         kind=workspace.kind or "vscode",
         hostname=f"tomato-ws-{workspace.id}",
-        access=spec_service.service_access(workspace.docker_image or "", workspace.id, workspace.slug)
+        access=spec_service.service_access(
+            workspace.docker_image or "",
+            workspace.id,
+            workspace.slug,
+            spec_service.parse_env(getattr(workspace, "env_json", None)),
+        )
         if (workspace.kind or "vscode") == "container"
         else None,
         logs=docker_ws.get_progress(workspace.id),
@@ -333,13 +350,21 @@ def create_from_spec(db: Session, spec_id: str) -> tuple[Workspace, Spec, bool]:
     spec = spec_service.get_spec(db, spec_id)
     if spec is None:
         raise ValueError("사양서를 찾을 수 없습니다.")
+    env = spec_service.resolved_env(spec)
+    command = spec_service.resolved_command(spec)
     if spec.workspace_id:
         existing = db.get(Workspace, spec.workspace_id)
         if existing is not None:
             image_changed = existing.docker_image and existing.docker_image != spec.docker_image
             kind_changed = (existing.kind or "vscode") != (spec.kind or "vscode")
+            run_changed, env_changed = spec_service.run_config_changed(
+                spec.docker_image,
+                spec_service.parse_env(getattr(existing, "env_json", None)),
+                env,
+                spec_service.parse_command(getattr(existing, "command_json", None)),
+                command,
+            )
             if image_changed or kind_changed:
-                # 이미지가 다르면 기존 컨테이너를 삭제하고 새로 만든다
                 docker_ws.delete_workspace(db, existing)
                 spec.workspace_id = None
                 db.add(spec)
@@ -350,11 +375,16 @@ def create_from_spec(db: Session, spec_id: str) -> tuple[Workspace, Spec, bool]:
                 existing.memory_limit = spec.memory
                 existing.docker_image = spec.docker_image
                 existing.kind = spec.kind or "vscode"
+                existing.env_json = json.dumps(env, ensure_ascii=False)
+                existing.command_json = json.dumps(command, ensure_ascii=False)
                 db.add(existing)
                 db.commit()
-                workspace = docker_ws.start_workspace(
-                    db, existing, prepare_python=(spec.kind or "vscode") == "vscode"
-                )
+                if (spec.kind or "vscode") == "container" and run_changed:
+                    workspace = docker_ws.recreate_workspace(db, existing, reset_volume=env_changed)
+                else:
+                    workspace = docker_ws.start_workspace(
+                        db, existing, prepare_python=(spec.kind or "vscode") == "vscode"
+                    )
                 return workspace, spec, True
 
     packages = spec_service.parse_packages(spec.pip_packages)
@@ -368,6 +398,8 @@ def create_from_spec(db: Session, spec_id: str) -> tuple[Workspace, Spec, bool]:
         apt_packages=apt_packages,
         docker_image=spec.docker_image,
         kind=spec.kind or "vscode",
+        env_json=json.dumps(env, ensure_ascii=False),
+        command_json=json.dumps(command, ensure_ascii=False),
     )
     spec_service.touch_spec_workspace(db, spec, workspace.id)
     workspace = docker_ws.start_workspace(
@@ -411,6 +443,8 @@ def _run_tool(
             notes=args.get("notes") or "",
             markdown=args.get("markdown") or "",
             spec_id=spec_id or None,
+            env=args.get("env") if isinstance(args.get("env"), dict) else None,
+            command=args.get("command") if isinstance(args.get("command"), list) else None,
         )
         payload = spec_service.spec_to_dict(spec)
         return payload, {"spec": spec}

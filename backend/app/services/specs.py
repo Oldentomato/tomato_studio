@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 
 from sqlalchemy.orm import Session
 
@@ -50,6 +51,7 @@ def parse_packages(raw: str | None) -> list[str]:
 
 
 def spec_to_dict(spec: Spec) -> dict:
+    env = resolved_env(spec)
     return {
         "id": spec.id,
         "name": spec.name,
@@ -60,7 +62,9 @@ def spec_to_dict(spec: Spec) -> dict:
         "pip_packages": parse_packages(spec.pip_packages),
         "apt_packages": parse_packages(spec.apt_packages),
         "kind": spec.kind or "vscode",
-        "access": service_access(spec.docker_image, spec.workspace_id, None)
+        "env": env,
+        "command": parse_command(getattr(spec, "command_json", None)),
+        "access": service_access(spec.docker_image, spec.workspace_id, None, env)
         if (spec.kind or "vscode") == "container"
         else None,
         "notes": spec.notes,
@@ -239,7 +243,50 @@ def service_volume_path(image: str) -> str:
     }.get(image_basename(image), "/data")
 
 
-def service_environment(image: str) -> dict[str, str]:
+def parse_env(raw: str | dict | None) -> dict[str, str]:
+    if isinstance(raw, dict):
+        data = raw
+    elif raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = {}
+    else:
+        data = {}
+    out: dict[str, str] = {}
+    for key, value in data.items():
+        name = str(key).strip()
+        text = str(value).strip()
+        if name and text:
+            out[name] = text
+    return out
+
+
+def parse_command(raw: str | list | None) -> list[str]:
+    if isinstance(raw, list):
+        parts = [str(item).strip() for item in raw if str(item).strip()]
+    elif raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = shlex.split(raw)
+        if isinstance(data, list):
+            parts = [str(item).strip() for item in data if str(item).strip()]
+        elif isinstance(data, str) and data.strip():
+            parts = shlex.split(data)
+        else:
+            parts = []
+    else:
+        parts = []
+    cleaned: list[str] = []
+    for part in parts:
+        if any(ch in part for ch in ";|&$`\n"):
+            raise ValueError(f"허용되지 않는 실행 인자입니다: {part}")
+        cleaned.append(part)
+    return cleaned
+
+
+def default_service_env(image: str) -> dict[str, str]:
     name = image_basename(image)
     if name in {"postgres", "postgresql"}:
         return {
@@ -262,25 +309,103 @@ def service_environment(image: str) -> dict[str, str]:
     return {}
 
 
-def service_access(image: str, workspace_id: str | None, slug: str | None = None) -> dict | None:
+def resolved_env(spec: Spec | None = None, *, image: str | None = None, extra: dict | None = None) -> dict[str, str]:
+    docker_image = image or (spec.docker_image if spec is not None else "")
+    stored = parse_env(getattr(spec, "env_json", None) if spec is not None else None)
+    merged = {**default_service_env(docker_image), **stored, **parse_env(extra)}
+    return {key: value for key, value in merged.items() if value}
+
+
+def resolved_command(spec: Spec | None = None, extra: list[str] | str | None = None) -> list[str]:
+    stored = parse_command(getattr(spec, "command_json", None) if spec is not None else None)
+    override = parse_command(extra)
+    return override or stored
+
+
+def run_config_changed(
+    image: str,
+    old_env: dict[str, str] | None,
+    new_env: dict[str, str] | None,
+    old_command: list[str] | None = None,
+    new_command: list[str] | None = None,
+) -> tuple[bool, bool]:
+    env_changed = service_environment(image, old_env) != service_environment(image, new_env)
+    command_changed = parse_command(old_command) != parse_command(new_command)
+    return env_changed or command_changed, env_changed
+
+
+def format_run_command(
+    image: str,
+    *,
+    env: dict[str, str] | None = None,
+    command: list[str] | None = None,
+    workspace_id: str | None = None,
+) -> str:
+    name = f"tomato-ws-{workspace_id}" if workspace_id else "tomato-ws-<id>"
+    parts = [
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        name,
+        "--hostname",
+        name,
+        "--network",
+        "tomato-studio",
+    ]
+    for key, value in (env or {}).items():
+        parts.extend(["-e", f"{key}={value}"])
+    parts.append(image)
+    parts.extend(command or [])
+    return shlex.join(parts)
+
+
+def service_environment(image: str, env: dict[str, str] | None = None) -> dict[str, str]:
+    return {**default_service_env(image), **parse_env(env)}
+
+
+def service_access(
+    image: str,
+    workspace_id: str | None,
+    slug: str | None = None,
+    env: dict[str, str] | None = None,
+) -> dict | None:
     hostname = f"tomato-ws-{workspace_id}" if workspace_id else "tomato-ws-<id>"
     aliases = [hostname]
     if slug:
         aliases.append(slug)
     name = image_basename(image)
+    resolved = service_environment(image, env)
     common = {
         "network": "tomato-studio",
         "hostname": hostname,
         "aliases": aliases,
     }
     if name in {"postgres", "postgresql"}:
-        return {**common, "port": 5432, "user": "tomato", "password": "tomato", "database": "tomato"}
+        return {
+            **common,
+            "port": 5432,
+            "user": resolved.get("POSTGRES_USER", "tomato"),
+            "password": resolved.get("POSTGRES_PASSWORD", "tomato"),
+            "database": resolved.get("POSTGRES_DB", "tomato"),
+        }
     if name in {"mysql", "mariadb"}:
-        return {**common, "port": 3306, "user": "tomato", "password": "tomato", "database": "tomato"}
+        return {
+            **common,
+            "port": 3306,
+            "user": resolved.get("MYSQL_USER", "tomato"),
+            "password": resolved.get("MYSQL_PASSWORD", "tomato"),
+            "database": resolved.get("MYSQL_DATABASE", "tomato"),
+        }
     if name == "redis":
         return {**common, "port": 6379}
     if name in {"mongo", "mongodb"}:
-        return {**common, "port": 27017, "user": "tomato", "password": "tomato"}
+        return {
+            **common,
+            "port": 27017,
+            "user": resolved.get("MONGO_INITDB_ROOT_USERNAME", "tomato"),
+            "password": resolved.get("MONGO_INITDB_ROOT_PASSWORD", "tomato"),
+        }
     if name == "memcached":
         return {**common, "port": 11211}
     if name == "rabbitmq":
@@ -300,6 +425,7 @@ SPEC_MARKDOWN_GUIDE = """마크다운 사양서 템플릿 (이 절 제목만 사
 - 종류: VS Code 또는 일반 컨테이너
 - 이미지: `이름:태그`
 - 메모리: 512m | 1g | 2g | 4g | 8g
+- 실행 명령: 부가 요청이 있으면 실제 쓸 `docker run ...` 한 줄. 없으면 생략.
 
 ## 설치
 pip/apt가 있을 때만. 없으면 절 생략.
@@ -338,8 +464,9 @@ def build_spec_markdown(
     apt_packages: list[str] | None = None,
     notes: str = "",
     workspace_id: str | None = None,
+    env: dict[str, str] | None = None,
+    command: list[str] | None = None,
 ) -> str:
-    kind_label = "VS Code" if kind == "vscode" else "일반 컨테이너"
     lines = [
         f"# {name}",
         "",
@@ -347,9 +474,14 @@ def build_spec_markdown(
         summary.strip() or "요청한 개발 환경",
         "",
         "## 실행",
-        f"- 종류: {kind_label}",
-        f"- 이미지: `{docker_image}`",
-        f"- 메모리: {memory}",
+        *execution_body(
+            docker_image=docker_image,
+            memory=memory,
+            kind=kind,
+            env=env,
+            command=command,
+            workspace_id=workspace_id,
+        ),
     ]
     pip_packages = pip_packages or []
     apt_packages = apt_packages or []
@@ -360,24 +492,69 @@ def build_spec_markdown(
         if apt_packages:
             lines.append("- apt: " + ", ".join(f"`{item}`" for item in apt_packages))
     if kind == "container":
-        access = service_access(docker_image, workspace_id)
-        lines += ["", "## 접속", f"- 네트워크: `{(access or {}).get('network', 'tomato-studio')}`"]
-        if access:
-            lines.append(f"- 호스트: `{access['hostname']}`")
-            if access.get("port"):
-                lines.append(f"- 포트: {access['port']}")
-            if access.get("user"):
-                lines.append(f"- 계정: `{access['user']}`")
-            if access.get("password"):
-                lines.append(f"- 비밀번호: `{access['password']}`")
-            if access.get("database"):
-                lines.append(f"- DB: `{access['database']}`")
+        lines += ["", "## 접속", *access_body(service_access(docker_image, workspace_id, env=env))]
     if (notes or "").strip():
         lines += ["", "## 메모", notes.strip()]
     return "\n".join(lines)
 
 
+def replace_section(text: str, heading: str, body_lines: list[str]) -> str:
+    block = "\n".join([f"## {heading}", *body_lines])
+    if re.search(rf"^## {re.escape(heading)}\s*$", text, flags=re.M):
+        return re.sub(
+            rf"^## {re.escape(heading)}\s*\n(?:.*\n)*?(?=^## |\Z)",
+            block + "\n\n",
+            text,
+            count=1,
+            flags=re.M,
+        )
+    return text.rstrip() + "\n\n" + block + "\n"
+
+
+def execution_body(
+    *,
+    docker_image: str,
+    memory: str,
+    kind: str,
+    env: dict[str, str] | None = None,
+    command: list[str] | None = None,
+    workspace_id: str | None = None,
+) -> list[str]:
+    kind_label = "VS Code" if kind == "vscode" else "일반 컨테이너"
+    lines = [
+        f"- 종류: {kind_label}",
+        f"- 이미지: `{docker_image}`",
+        f"- 메모리: {memory}",
+    ]
+    if kind == "container":
+        lines.append(
+            "- 실행 명령: `"
+            + format_run_command(docker_image, env=env, command=command, workspace_id=workspace_id)
+            + "`"
+        )
+    return lines
+
+
+def access_body(access: dict | None) -> list[str]:
+    if not access:
+        return ["- 네트워크: `tomato-studio`"]
+    lines = [f"- 네트워크: `{access.get('network', 'tomato-studio')}`"]
+    if access.get("hostname"):
+        lines.append(f"- 호스트: `{access['hostname']}`")
+    if access.get("port"):
+        lines.append(f"- 포트: {access['port']}")
+    if access.get("user"):
+        lines.append(f"- 계정: `{access['user']}`")
+    if access.get("password"):
+        lines.append(f"- 비밀번호: `{access['password']}`")
+    if access.get("database"):
+        lines.append(f"- DB: `{access['database']}`")
+    return lines
+
+
 def resolved_markdown(spec: Spec) -> str:
+    env = resolved_env(spec)
+    command = resolved_command(spec)
     text = (getattr(spec, "markdown", None) or "").strip()
     if not text:
         text = build_spec_markdown(
@@ -390,7 +567,28 @@ def resolved_markdown(spec: Spec) -> str:
             apt_packages=parse_packages(spec.apt_packages),
             notes=spec.notes or "",
             workspace_id=spec.workspace_id,
+            env=env,
+            command=command,
         )
+    else:
+        text = replace_section(
+            text,
+            "실행",
+            execution_body(
+                docker_image=spec.docker_image,
+                memory=spec.memory,
+                kind=spec.kind or "vscode",
+                env=env,
+                command=command,
+                workspace_id=spec.workspace_id,
+            ),
+        )
+        if (spec.kind or "vscode") == "container":
+            text = replace_section(
+                text,
+                "접속",
+                access_body(service_access(spec.docker_image, spec.workspace_id, env=env)),
+            )
     if spec.workspace_id:
         text = text.replace("tomato-ws-<id>", f"tomato-ws-{spec.workspace_id}")
     return text
@@ -410,6 +608,8 @@ def write_spec(
     notes: str = "",
     markdown: str | None = None,
     spec_id: str | None = None,
+    env: dict | None = None,
+    command: list[str] | str | None = None,
 ) -> Spec:
     image = normalize_image(docker_image)
     resolved_kind = normalize_kind(kind, image)
@@ -421,29 +621,58 @@ def write_spec(
         apt = []
     note_text = (notes or "").strip()
     body = normalize_markdown(markdown)
+    existing = db.get(Spec, spec_id) if spec_id else None
+    merged_env = resolved_env(existing, image=image, extra=env)
+    merged_command = resolved_command(existing, extra=command)
+    mem = normalize_memory(memory)
+    workspace_id = existing.workspace_id if existing is not None else None
     if not body:
         body = build_spec_markdown(
             name=name.strip()[:80] or "dev-env",
             summary=summary,
             docker_image=image,
-            memory=normalize_memory(memory),
+            memory=mem,
             kind=resolved_kind,
             pip_packages=pip,
             apt_packages=apt,
             notes=note_text,
+            workspace_id=workspace_id,
+            env=merged_env,
+            command=merged_command,
         )
-    existing = db.get(Spec, spec_id) if spec_id else None
+    elif resolved_kind == "container":
+        body = replace_section(
+            body,
+            "실행",
+            execution_body(
+                docker_image=image,
+                memory=mem,
+                kind=resolved_kind,
+                env=merged_env,
+                command=merged_command,
+                workspace_id=workspace_id,
+            ),
+        )
+        body = replace_section(
+            body,
+            "접속",
+            access_body(service_access(image, workspace_id, env=merged_env)),
+        )
+    env_text = json.dumps(merged_env, ensure_ascii=False)
+    command_text = json.dumps(merged_command, ensure_ascii=False)
     if existing is not None:
         existing.name = name.strip()[:80] or existing.name
         existing.summary = (summary or "").strip()
         existing.docker_image = image
-        existing.memory = normalize_memory(memory)
+        existing.memory = mem
         existing.python_version = (python_version or python_version_from_image(image)).strip()[:16]
         existing.pip_packages = json.dumps(pip, ensure_ascii=False)
         existing.apt_packages = json.dumps(apt, ensure_ascii=False)
         existing.kind = resolved_kind
         existing.notes = note_text
         existing.markdown = body
+        existing.env_json = env_text
+        existing.command_json = command_text
         db.add(existing)
         db.commit()
         db.refresh(existing)
@@ -453,51 +682,15 @@ def write_spec(
         name=name.strip()[:80] or "dev-env",
         summary=(summary or "").strip(),
         docker_image=image,
-        memory=normalize_memory(memory),
+        memory=mem,
         python_version=(python_version or python_version_from_image(image)).strip()[:16],
         pip_packages=json.dumps(pip, ensure_ascii=False),
         apt_packages=json.dumps(apt, ensure_ascii=False),
         kind=resolved_kind,
         notes=note_text,
         markdown=body,
-    )
-    db.add(spec)
-    db.commit()
-    db.refresh(spec)
-    return spec
-    image = normalize_image(docker_image)
-    resolved_kind = normalize_kind(kind, image)
-    if resolved_kind == "vscode":
-        pip = normalize_packages(pip_packages)
-        apt = merge_apt_packages(normalize_apt_packages(apt_packages), pip)
-    else:
-        pip = []
-        apt = []
-    note_text = (notes or "").strip()
-    body = normalize_markdown(markdown)
-    if not body:
-        body = build_spec_markdown(
-            name=name.strip()[:80] or "dev-env",
-            summary=summary,
-            docker_image=image,
-            memory=normalize_memory(memory),
-            kind=resolved_kind,
-            pip_packages=pip,
-            apt_packages=apt,
-            notes=note_text,
-        )
-    spec = Spec(
-        id=new_id(),
-        name=name.strip()[:80] or "dev-env",
-        summary=(summary or "").strip(),
-        docker_image=image,
-        memory=normalize_memory(memory),
-        python_version=(python_version or python_version_from_image(image)).strip()[:16],
-        pip_packages=json.dumps(pip, ensure_ascii=False),
-        apt_packages=json.dumps(apt, ensure_ascii=False),
-        kind=resolved_kind,
-        notes=note_text,
-        markdown=body,
+        env_json=env_text,
+        command_json=command_text,
     )
     db.add(spec)
     db.commit()

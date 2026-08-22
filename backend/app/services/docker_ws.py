@@ -278,6 +278,8 @@ def create_workspace(
     apt_packages: list[str] | None = None,
     docker_image: str | None = None,
     kind: str = "vscode",
+    env_json: str | None = None,
+    command_json: str | None = None,
 ) -> Workspace:
     from .volume_files import ensure_writable
 
@@ -310,6 +312,8 @@ def create_workspace(
         apt_packages=json.dumps(apt_packages or [], ensure_ascii=False),
         docker_image=docker_image,
         kind=resolved_kind,
+        env_json=env_json or "{}",
+        command_json=command_json or "[]",
     )
     db.add(workspace)
     db.commit()
@@ -712,12 +716,13 @@ def _run_vscode_container(workspace: Workspace):
 
 
 def _run_service_container(workspace: Workspace, *, keep_alive: bool | None = None):
-    from .specs import needs_keep_alive, service_environment, service_volume_path
+    from .specs import needs_keep_alive, parse_command, parse_env, service_environment, service_volume_path
 
     image = (workspace.docker_image or "").strip() or "ubuntu:24.04"
     ensure_image(workspace.id, image)
     client = docker_client()
-    env = service_environment(image)
+    env = service_environment(image, parse_env(getattr(workspace, "env_json", None)))
+    command = parse_command(getattr(workspace, "command_json", None))
     volume_path = service_volume_path(image)
     stay_up = needs_keep_alive(image) if keep_alive is None else keep_alive
     add_progress(workspace.id, f"컨테이너 시작: tomato-ws-{workspace.id} ({image})")
@@ -736,7 +741,10 @@ def _run_service_container(workspace: Workspace, *, keep_alive: bool | None = No
         },
         "restart_policy": {"Name": "no"},
     }
-    if stay_up:
+    if command:
+        add_progress(workspace.id, "실행 명령: " + " ".join(command))
+        run_kwargs["command"] = command
+    elif stay_up:
         add_progress(workspace.id, "데몬이 없는 이미지라 대기 프로세스로 유지합니다")
         run_kwargs["command"] = ["/bin/sh", "-c", "sleep infinity || tail -f /dev/null"]
     created = client.containers.run(image, **run_kwargs)
@@ -831,6 +839,31 @@ def start_workspace(db: Session, workspace: Workspace, *, prepare_python: bool =
             db.commit()
             db.refresh(workspace)
             raise
+
+
+def recreate_workspace(db: Session, workspace: Workspace, *, reset_volume: bool = False) -> Workspace:
+    with workspace_lock(workspace.id):
+        db.refresh(workspace)
+        container = _get_container(workspace)
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except DockerException:
+                pass
+        workspace.container_id = None
+        workspace.host_port = None
+        workspace.status = "stopped"
+        workspace.error_message = None
+        if reset_volume:
+            add_progress(workspace.id, "실행 설정이 바뀌어 볼륨을 초기화합니다")
+            try:
+                docker_client().volumes.get(workspace.volume_name).remove(force=True)
+            except (NotFound, DockerException):
+                pass
+            docker_client().volumes.create(workspace.volume_name, labels={LABEL_STUDIO: "workspace"})
+        db.add(workspace)
+        db.commit()
+    return start_workspace(db, workspace, prepare_python=False)
 
 
 def stop_workspace(db: Session, workspace: Workspace) -> Workspace:

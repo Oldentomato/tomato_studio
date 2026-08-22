@@ -132,6 +132,8 @@ def migrate() -> None:
                 "apt_packages": "TEXT",
                 "docker_image": "VARCHAR(120)",
                 "kind": "VARCHAR(16) DEFAULT 'vscode'",
+                "env_json": "TEXT",
+                "command_json": "TEXT",
             }
             for name, ddl in extras.items():
                 if name not in columns:
@@ -142,6 +144,8 @@ def migrate() -> None:
                 "apt_packages": "TEXT",
                 "kind": "VARCHAR(16) DEFAULT 'vscode'",
                 "markdown": "TEXT",
+                "env_json": "TEXT",
+                "command_json": "TEXT",
             }
             for name, ddl in spec_extras.items():
                 if name not in spec_cols:
