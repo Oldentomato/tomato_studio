@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+.pytest_cache/
+.mypy_cache/
+data/
+
+node_modules/
+dist/
+.vite/
+
+.env
+.env.local
+*.log
