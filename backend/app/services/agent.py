@@ -16,6 +16,10 @@ from . import docker_ws, specs as spec_service
 
 SSE_PING_INTERVAL_SECONDS = 15.0
 
+_WEB_PORT_HINT = ", ".join(
+    f"{name}={port}" for name, port in sorted(spec_service.WEB_UI_PORTS.items())
+)
+
 SYSTEM_PROMPT = """당신은 Tomato Studio의 개발 환경 에이전트입니다.
 사용자는 한국어로 개발 환경을 요청합니다. VS Code 워크스페이스, 일반 컨테이너, 웹 UI 컨테이너를 구분합니다.
 
@@ -23,12 +27,15 @@ SYSTEM_PROMPT = """당신은 Tomato Studio의 개발 환경 에이전트입니�
 1) write_spec: 요청을 사양서로 정리합니다. 구조화 필드와 마크다운 본문을 함께 채웁니다. 기존 사양서를 고칠 때는 spec_id를 넣습니다.
 2) update_container: 이미 있는 워크스페이스에 사양서를 적용하고 다시 시작합니다. 새 컨테이너를 추가로 만들지 않습니다.
 3) delete_container: 워크스페이스 id로 컨테이너와 볼륨을 삭제합니다.
+4) lookup_containers: 이미 있는 다른 컨테이너의 접속 정보(id, 이름, hostname, 포트, env)를 조회합니다. query에 이름/id/slug/호스트명을 넣습니다. 비우면 목록입니다.
 
 원칙 (절대):
 - 컨테이너를 처음부터 만드는 도구는 없습니다. create_container를 호출하지 마세요.
 - 새 환경을 만들어 달라는 요청이 오면 write_spec만 호출하고, 오른쪽 사양서를 확인하라고 안내합니다.
 - "만들어줘"라고 해도 사양서만 작성합니다. 새 컨테이너는 사용자가 사양서의 **컨테이너 만들기** 버튼을 누를 때만 생깁니다.
-- 예외: 사용자가 오류 난 카드를 고른 뒤 고쳐 달라고 하면 write_spec(spec_id=기존) 후 update_container(workspace_id=기존)를 호출하세요.
+- 새 환경을 만들 때는 update_container를 호출하지 마세요. write_spec만 하고 버튼을 안내하세요.
+- update_container는 사용자가 기존 카드를 선택한 뒤, 그 카드의 workspace_id가 있을 때만 호출하세요. lookup으로 찾은 연동 대상 id를 update에 넣지 마세요.
+- 예외: 사용자가 오류 난 카드를 고른 뒤 고쳐 달라고 하면, error/logs를 읽고 원인을 고친 다음 write_spec(spec_id=기존) 후 update_container(workspace_id=기존)를 호출하세요. 같은 값으로 재적용만 하지 마세요.
 - 답변은 짧고 한국어로. 사양서 내용을 채팅에 반복하지 말고 오른쪽 패널을 보라고 안내합니다.
 - kind: vscode, container, web.
   - vscode: code-server IDE. pip/apt는 여기에만 설치합니다.
@@ -37,11 +44,25 @@ SYSTEM_PROMPT = """당신은 Tomato Studio의 개발 환경 에이전트입니�
 - docker_image는 Docker Hub 이미지. 예: python:3.12-slim, ubuntu:24.04, postgres:16, nginx:alpine, grafana/grafana:latest.
 - 메모리: 512m, 1g, 2g, 4g, 8g.
 - vscode일 때만 pip/apt를 채웁니다. container/web이면 pip_packages와 apt_packages는 빈 배열.
-- kind=web 이면 http_port를 반드시 채웁니다. 컨테이너 안에서 웹 서버가 듣는 포트입니다. 이미지마다 다릅니다. 모를 때만 흔한 기본값(80, 3000, 8080, 8888 등)을 쓰고, 알면 그 이미지의 실제 포트를 넣습니다.
+- kind=web 이면 http_port를 반드시 채웁니다. 이것은 컨테이너 **안에서** 웹 서버가 듣는 포트입니다. 호스트에 랜덤으로 열리는 공개 포트(host_port)가 아닙니다.
+- 웹 이미지 기본 내부 포트: """ + _WEB_PORT_HINT + """
+- 목록에 없는 이미지는 Docker Hub의 EXPOSE/문서 포트를 쓰세요. 추측으로 80을 넣지 마세요.
 - 부가 요청(환경변수, 실행 인자, 비밀번호, 커스텀 프로세스, 베이스 패스 등)은 env와 command에 넣습니다. DB만이 아닙니다.
 - markdown 실행 절에는 실제로 쓸 docker run 명령을 `실행 명령`으로 보여줍니다.
 - 파일 올리기/받기는 도구가 없습니다. 사용자가 파일을 말하면 워크스페이스 카드의 **파일** 버튼을 안내하세요.
 - 이미 만든 사양서를 고칠 때는 반드시 spec_id를 넣습니다.
+- 사용자가 다른 컨테이너 이름/id를 말하거나, 기존 서비스에 붙이거나 연동하라고 하면 추측하지 말고 먼저 lookup_containers를 호출하세요.
+- 다른 컨테이너에 접속할 때는 host_port가 아니라 hostname(`tomato-ws-<id>`)과 connect_port(컨테이너 내부 포트)를 쓰세요. 같은 tomato-studio 네트워크입니다.
+- 조회한 env(계정, 비밀번호, DB 이름 등)와 포트를 사양서의 env/command/markdown에 그대로 반영하세요. 호스트명을 지어내지 마세요.
+
+오류 자가진단:
+- 선택한 카드의 error, logs, http_port, env, command, EXPOSE 힌트를 읽고 원인에 해당하는 필드만 바꿉니다.
+- "웹 화면이 준비되지 않았습니다": 스튜디오가 호스트 공개 포트로 HTTP GET / 를 최대 90초 때렸는데 연결 실패이거나 5xx입니다. kind=web 컨테이너가 기동은 됐지만, 지정한 http_port에서 HTTP가 안 열린 상태입니다.
+  1) 로그에 EXPOSE와 http_port가 다르면 http_port를 EXPOSE/공식 포트로 고칩니다. 로그의 host port N을 http_port로 복사하지 마세요.
+  2) 컨테이너가 종료됐거나 로그에 missing password, cannot bind, permission, invalid config가 있으면 env 또는 command를 고칩니다.
+  3) 앱이 127.0.0.1만 들으면 command에 0.0.0.0 bind를 넣습니다.
+  4) HTTP UI가 아닌 이미지면 kind를 container로 바꾸거나 웹 UI 이미지로 바꿉니다.
+  5) 원인을 못 찾으면 해당 이미지의 가장 흔한 포트로 http_port를 바꾸고, 그래도 같으면 env/command를 로그 기준으로 수정합니다. 동일한 spec으로 update만 반복하지 마세요.
 
 """ + spec_service.SPEC_MARKDOWN_GUIDE + """
 - 삭제 전에 현재 컨테이너 id를 확인합니다.
@@ -81,7 +102,7 @@ TOOLS = [
                     },
                     "http_port": {
                         "type": "integer",
-                        "description": "kind=web일 때 컨테이너 안 HTTP 리스닝 포트. 예: 3000, 80, 8888, 9090, 9000. 이미지 기본 포트에 맞출 것.",
+                        "description": "kind=web일 때 컨테이너 안에서 웹 서버가 듣는 포트. 호스트 공개 포트(host_port)가 아님. 이미지 EXPOSE/공식 포트에 맞출 것. grafana=3000, jupyter=8888, nginx=80, portainer=9000.",
                     },
                     "notes": {"type": "string", "description": "짧게 남을 주의점. markdown 메모 절과 맞춰도 됨"},
                     "markdown": {
@@ -111,7 +132,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "update_container",
-            "description": "이미 있는 워크스페이스에 사양서를 적용하고 다시 시작합니다. 오류 수정/업데이트용입니다.",
+            "description": "이미 있는 워크스페이스에 사양서를 적용하고 다시 시작합니다. 오류 수정/업데이트용입니다. workspace_id가 있는 기존 카드에만 쓰세요. 새 컨테이너를 만들 때는 호출하지 마세요.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -133,6 +154,22 @@ TOOLS = [
                     "workspace_id": {"type": "string"},
                 },
                 "required": ["workspace_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_containers",
+            "description": "이미 있는 워크스페이스/컨테이너의 접속 정보를 조회합니다. 다른 서비스에 붙이거나 사양서를 맞출 때 먼저 호출하세요.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "이름, workspace id, slug, tomato-ws-<id>, 이미지 이름. 비우면 전체 목록.",
+                    },
+                },
             },
         },
     },
@@ -224,6 +261,101 @@ def spec_out(spec) -> SpecOut:
     )
 
 
+def _listen_port(workspace: Workspace) -> int | None:
+    kind = (workspace.kind or "vscode").strip().lower()
+    if kind == "vscode":
+        return 8080
+    if kind == "web" and workspace.http_port:
+        return int(workspace.http_port)
+    access = spec_service.service_access(
+        workspace.docker_image or "",
+        workspace.id,
+        workspace.slug,
+        spec_service.parse_env(getattr(workspace, "env_json", None)),
+        kind=kind,
+        http_port=workspace.http_port,
+    )
+    port = (access or {}).get("port")
+    if port:
+        return int(port)
+    if workspace.http_port:
+        return int(workspace.http_port)
+    return None
+
+
+def _container_info(workspace: Workspace, *, detail: bool = False) -> dict[str, Any]:
+    docker_ws.sync_from_docker(workspace)
+    kind = (workspace.kind or "vscode").strip().lower() or "vscode"
+    hostname = f"tomato-ws-{workspace.id}"
+    aliases = [hostname]
+    if workspace.slug and workspace.slug not in aliases:
+        aliases.append(workspace.slug)
+    connect_port = _listen_port(workspace)
+    info: dict[str, Any] = {
+        "workspace_id": workspace.id,
+        "name": workspace.name,
+        "slug": workspace.slug,
+        "kind": kind,
+        "status": workspace.status,
+        "docker_image": workspace.docker_image,
+        "hostname": hostname,
+        "aliases": aliases,
+        "network": "tomato-studio",
+        "connect_port": connect_port,
+        "http_port": workspace.http_port,
+        "host_port": workspace.host_port,
+        "spec_id": workspace.spec_id,
+        "memory": workspace.memory_limit,
+    }
+    if detail:
+        env = spec_service.parse_env(getattr(workspace, "env_json", None))
+        command = spec_service.parse_command(getattr(workspace, "command_json", None))
+        access = spec_service.service_access(
+            workspace.docker_image or "",
+            workspace.id,
+            workspace.slug,
+            env,
+            kind=kind,
+            http_port=workspace.http_port,
+        )
+        info["env"] = env
+        info["command"] = command
+        info["access"] = access
+        info["error"] = workspace.error_message
+        info["connect"] = f"{hostname}:{connect_port}" if connect_port else hostname
+        info["note"] = (
+            "같은 tomato-studio 네트워크의 다른 컨테이너는 hostname:connect_port 로 접속하세요. "
+            "host_port는 브라우저/호스트용이며 컨테이너 간 통신에 쓰지 마세요."
+        )
+    return info
+
+
+def _workspace_matches(workspace: Workspace, query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    hostname = f"tomato-ws-{workspace.id}"
+    fields = [
+        workspace.id,
+        workspace.name or "",
+        workspace.slug or "",
+        hostname,
+        workspace.docker_image or "",
+        workspace.kind or "",
+        workspace.spec_id or "",
+    ]
+    return any(q == item.lower() or q in item.lower() or item.lower() in q for item in fields if item)
+
+
+def _lookup_containers(db: Session, query: str = "") -> list[dict[str, Any]]:
+    rows = db.query(Workspace).order_by(Workspace.created_at.desc()).all()
+    matched = [item for item in rows if _workspace_matches(item, query)]
+    if not query:
+        matched = matched[:20]
+    detail = bool(query) or len(matched) <= 5
+    return [_container_info(item, detail=detail) for item in matched]
+
+
 def _snapshot(db: Session) -> str:
     spec_rows = spec_service.list_specs(db)[:8]
     workspaces = db.query(Workspace).order_by(Workspace.created_at.desc()).all()
@@ -232,14 +364,38 @@ def _snapshot(db: Session) -> str:
         for item in spec_rows
     ] or ["- 없음"]
     ws_lines = []
-    for item in workspaces[:8]:
-        docker_ws.sync_from_docker(item)
+    for item in workspaces[:16]:
+        info = _container_info(item, detail=False)
         ws_lines.append(
-            f"- {item.id} | {item.name} | {item.status} | spec={item.spec_id} | err={item.error_message or '-'}"
+            f"- {info['workspace_id']} | {info['name']} | {info['kind']} | {info['status']} | "
+            f"host={info['hostname']} | port={info['connect_port'] or '-'} | image={info['docker_image'] or '-'} | "
+            f"spec={info['spec_id'] or '-'}"
         )
     if not ws_lines:
         ws_lines = ["- 없음"]
     return "현재 사양서:\n" + "\n".join(spec_lines) + "\n현재 컨테이너:\n" + "\n".join(ws_lines)
+
+
+def _mentioned_container_context(db: Session, message: str) -> str:
+    text = (message or "").strip().lower()
+    if not text:
+        return ""
+    found: list[Workspace] = []
+    seen: set[str] = set()
+    for item in db.query(Workspace).order_by(Workspace.created_at.desc()).all():
+        needles = [item.id, f"tomato-ws-{item.id}", item.slug or "", item.name or ""]
+        if any(needle and len(needle) >= 2 and needle.lower() in text for needle in needles):
+            if item.id not in seen:
+                seen.add(item.id)
+                found.append(item)
+    if not found:
+        return ""
+    records = [_container_info(item, detail=True) for item in found]
+    return (
+        "사용자가 메시지에서 언급한 컨테이너입니다. 사양서를 만들거나 고칠 때 이 접속 정보를 사용하세요. "
+        "hostname:connect_port 로 붙이고 host_port는 쓰지 마세요.\n"
+        + json.dumps(records, ensure_ascii=False, default=str)
+    )
 
 
 def _is_repair_request(message: str) -> bool:
@@ -254,8 +410,10 @@ def _selected_context(db: Session, workspace_id: str | None) -> tuple[str, Works
     if workspace is None:
         return "선택한 워크스페이스를 찾을 수 없습니다.", None
     docker_ws.sync_from_docker(workspace)
-    logs = docker_ws.get_progress(workspace.id)[-15:]
+    logs = docker_ws.get_progress(workspace.id)[-40:]
     spec = spec_service.get_spec(db, workspace.spec_id) if workspace.spec_id else None
+    env = spec_service.parse_env(getattr(workspace, "env_json", None))
+    command = spec_service.parse_command(getattr(workspace, "command_json", None))
     lines = [
         "사용자가 오른쪽에서 선택한 워크스페이스입니다. 이 대상을 우선하세요.",
         f"- workspace_id: {workspace.id}",
@@ -263,6 +421,10 @@ def _selected_context(db: Session, workspace_id: str | None) -> tuple[str, Works
         f"- kind: {workspace.kind or 'vscode'}",
         f"- status: {workspace.status}",
         f"- docker_image: {workspace.docker_image or '-'}",
+        f"- http_port: {workspace.http_port or '-'} (컨테이너 내부 리스닝 포트)",
+        f"- host_port: {workspace.host_port or '-'} (호스트 공개 포트. http_port가 아님)",
+        f"- env: {json.dumps(env, ensure_ascii=False) if env else '-'}",
+        f"- command: {json.dumps(command, ensure_ascii=False) if command else '-'}",
         f"- spec_id: {workspace.spec_id or '없음'}",
         f"- error: {workspace.error_message or '없음'}",
     ]
@@ -270,12 +432,17 @@ def _selected_context(db: Session, workspace_id: str | None) -> tuple[str, Works
         lines.append("- logs:")
         lines.extend(f"  {line}" for line in logs)
     if spec:
+        spec_env = spec_service.parse_env(getattr(spec, "env_json", None))
+        spec_cmd = spec_service.parse_command(getattr(spec, "command_json", None))
         lines.append(
-            f"- 사양서: {spec.name} | {spec.kind} | {spec.docker_image} | {spec.memory}"
+            f"- 사양서: {spec.name} | {spec.kind} | {spec.docker_image} | {spec.memory} | "
+            f"http_port={spec.http_port or '-'} | env={json.dumps(spec_env, ensure_ascii=False)} | "
+            f"command={json.dumps(spec_cmd, ensure_ascii=False)}"
         )
     lines.append(
-        "이 카드의 오류를 고쳐 업데이트하라면 write_spec에 spec_id를 넣어 같은 사양서를 수정한 뒤 "
-        "update_container(workspace_id)를 호출하세요. 새 컨테이너를 추가로 만들지 마세요."
+        "이 카드의 오류를 고쳐 업데이트하라면 error/logs를 보고 원인 필드를 바꾼 뒤 "
+        "write_spec에 spec_id를 넣어 같은 사양서를 수정하고 update_container(workspace_id)를 호출하세요. "
+        "같은 값으로 재적용하거나 새 컨테이너를 추가로 만들지 마세요."
     )
     return "\n".join(lines), workspace
 
@@ -526,10 +693,15 @@ def _run_tool(
         return payload, {"spec": spec}
 
     if name == "update_container":
-        workspace_id = args.get("workspace_id") or (selected_workspace.id if selected_workspace else "")
+        workspace_id = str(args.get("workspace_id") or "").strip() or (
+            selected_workspace.id if selected_workspace else ""
+        )
         workspace = db.get(Workspace, workspace_id) if workspace_id else None
         if workspace is None:
-            raise ValueError("업데이트할 워크스페이스가 없습니다. 오른쪽 카드를 선택한 뒤 요청하세요.")
+            raise ValueError(
+                "새 컨테이너는 update_container로 만들 수 없습니다. "
+                "write_spec만 호출하고 사용자에게 오른쪽 **컨테이너 만들기** 버튼을 안내하세요."
+            )
         spec_id = args.get("spec_id") or (latest_spec.id if latest_spec is not None else "") or workspace.spec_id
         spec = spec_service.get_spec(db, spec_id) if spec_id else None
         if spec is None:
@@ -561,6 +733,17 @@ def _run_tool(
         docker_ws.delete_workspace(db, workspace)
         return {"deleted": workspace_id, "name": name_label}, {"deleted_id": workspace_id}
 
+    if name == "lookup_containers":
+        query = str(args.get("query") or "").strip()
+        records = _lookup_containers(db, query)
+        if not records:
+            return {
+                "containers": [],
+                "query": query,
+                "message": "일치하는 컨테이너가 없습니다. query를 비우면 전체 목록을 볼 수 있습니다.",
+            }, {}
+        return {"containers": records, "query": query, "count": len(records)}, {}
+
     raise ValueError(f"알 수 없는 도구: {name}")
 
 
@@ -591,6 +774,7 @@ def _chat_core(
     history = _messages(conversation)
     history.append({"role": "user", "content": message})
     focus_text, selected_workspace = _selected_context(db, workspace_id)
+    mentioned_text = _mentioned_container_context(db, message)
     repair = bool(selected_workspace) and _is_repair_request(message)
 
     if emit:
@@ -603,6 +787,8 @@ def _chat_core(
     ]
     if focus_text:
         openai_messages.append({"role": "system", "content": focus_text})
+    if mentioned_text:
+        openai_messages.append({"role": "system", "content": mentioned_text})
     openai_messages.extend(history)
 
     artifacts: dict[str, Any] = {}
@@ -710,12 +896,15 @@ def _chat_core(
             if call.function.name == "create_container":
                 trace = ToolTrace(
                     name="create_container",
-                    ok=False,
-                    summary="컨테이너는 사양서의 '컨테이너 만들기' 버튼으로만 생성합니다.",
+                    ok=True,
+                    summary="새 컨테이너는 사양서의 '컨테이너 만들기' 버튼으로 생성합니다.",
                 )
                 traces.append(trace)
                 content = json.dumps(
-                    {"error": "컨테이너 생성은 오른쪽 사양서 확인 후 버튼으로만 가능합니다."},
+                    {
+                        "skipped": True,
+                        "message": "컨테이너 생성은 오른쪽 사양서 확인 후 버튼으로만 가능합니다. write_spec만 하세요.",
+                    },
                     ensure_ascii=False,
                 )
                 if emit:
@@ -729,6 +918,32 @@ def _chat_core(
                 args = json.loads(call.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+
+            if call.function.name == "update_container":
+                workspace_id = str(args.get("workspace_id") or "").strip() or (
+                    selected_workspace.id if selected_workspace else ""
+                )
+                target = db.get(Workspace, workspace_id) if workspace_id else None
+                if target is None:
+                    trace = ToolTrace(
+                        name="update_container",
+                        ok=True,
+                        summary="새 컨테이너는 사양서의 '컨테이너 만들기' 버튼으로 생성합니다.",
+                    )
+                    traces.append(trace)
+                    content = json.dumps(
+                        {
+                            "skipped": True,
+                            "message": "대상 워크스페이스가 없습니다. 새 환경은 write_spec만 하고 버튼을 안내하세요.",
+                        },
+                        ensure_ascii=False,
+                    )
+                    if emit:
+                        emit("tool_result", trace.model_dump(mode="json"))
+                    tool_msg = {"role": "tool", "tool_call_id": call.id, "content": content}
+                    openai_messages.append(tool_msg)
+                    history.append(tool_msg)
+                    continue
 
             try:
                 result, extra = run_named(call.function.name, args)
@@ -839,4 +1054,8 @@ def _trace_summary(name: str, result: dict[str, Any]) -> str:
         return f"컨테이너 {ws.get('id')} · {ws.get('status')}"
     if name == "delete_container":
         return f"삭제 {result.get('deleted')}"
+    if name == "lookup_containers":
+        count = result.get("count") or len(result.get("containers") or [])
+        query = result.get("query") or "전체"
+        return f"조회 {count}개 · {query}"
     return name

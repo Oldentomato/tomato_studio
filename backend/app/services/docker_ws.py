@@ -441,18 +441,191 @@ def enforce_running_limit(db: Session, keep_id: str) -> None:
     db.commit()
 
 
-def _wait_until_ready(port: int) -> None:
-    deadline = time.time() + settings.ready_timeout_seconds
-    url = f"http://{resolved_public_workspace_host()}:{port}/"
-    with httpx.Client(follow_redirects=True, timeout=2.0) as client:
+def _container_log_tail(container, tail: int = 40) -> list[str]:
+    if container is None:
+        return []
+    try:
+        raw = container.logs(tail=tail)
+    except DockerException:
+        return []
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    return [line.strip() for line in text.splitlines() if line.strip()][-tail:]
+
+
+def _image_exposed_ports(image: str) -> list[int]:
+    if not image:
+        return []
+    try:
+        inspect = docker_client().api.inspect_image(image)
+    except (DockerException, ImageNotFound):
+        return []
+    exposed = (inspect.get("Config") or {}).get("ExposedPorts") or {}
+    ports: list[int] = []
+    for key in exposed:
+        num = str(key).split("/", 1)[0]
+        if num.isdigit():
+            ports.append(int(num))
+    return sorted(set(ports))
+
+
+def _format_web_ready_failure(
+    workspace: Workspace | None,
+    container,
+    url: str,
+    inner_port: int | None,
+    *,
+    last_http: str,
+    timeout: int | None = None,
+    crashed: bool = False,
+) -> str:
+    from .specs import default_web_port
+
+    seconds = int(timeout or settings.ready_timeout_seconds)
+    parts = ["웹 화면이 준비되지 않았습니다."]
+    if crashed:
+        parts.append("컨테이너가 HTTP를 듣기 전에 종료되었습니다.")
+    else:
+        parts.append(f"{seconds}초 동안 {url} 응답이 없거나 5xx만 받았습니다.")
+    if inner_port:
+        parts.append(
+            f"지정한 내부 포트(http_port)={inner_port}. "
+            "로그의 '대기 중 (port N)'에서 N은 호스트에 랜덤 배정된 포트이므로 http_port로 쓰지 마세요."
+        )
+    parts.append(f"마지막 확인: {last_http}")
+    image = (workspace.docker_image if workspace is not None else "") or ""
+    exposed = _image_exposed_ports(image)
+    if exposed:
+        listed = ", ".join(str(item) for item in exposed)
+        parts.append(f"이미지가 EXPOSE한 포트: {listed}")
+        if inner_port and inner_port not in exposed:
+            hint = str(exposed[0]) if len(exposed) == 1 else listed
+            parts.append(f"http_port={inner_port} 가 EXPOSE 목록에 없습니다. http_port를 {hint} 로 바꾸세요.")
+    elif image:
+        guessed = default_web_port(image)
+        if inner_port and inner_port != guessed:
+            parts.append(f"이 이미지의 흔한 웹 포트는 {guessed} 입니다. http_port를 {guessed}로 바꿔 보세요.")
+    logs = _container_log_tail(container)
+    if workspace is not None:
+        for line in logs[-20:]:
+            add_progress(workspace.id, line)
+    if logs:
+        parts.append("컨테이너 로그:\n" + "\n".join(logs[-12:]))
+    else:
+        parts.append(
+            "컨테이너 로그가 비어 있습니다. 프로세스가 포트를 열지 못했거나 잘못된 http_port를 게시했을 수 있습니다."
+        )
+    return "\n".join(parts)
+
+
+def _http_looks_ready(status: int) -> bool:
+    if status < 400:
+        return True
+    return status in {401, 403, 409}
+
+
+def _ready_probe_urls(port: int, workspace: Workspace | None) -> list[str]:
+    from .specs import web_ui_prefix
+
+    base = f"http://{resolved_public_workspace_host()}:{port}"
+    urls = [f"{base}/"]
+    kind = ((workspace.kind if workspace is not None else "") or "").strip().lower()
+    image = ((workspace.docker_image if workspace is not None else "") or "").lower()
+    if kind == "web" and workspace is not None:
+        prefix = web_ui_prefix(workspace.id).rstrip("/")
+        urls = [
+            f"{base}{prefix}/api/health",
+            f"{base}{prefix}/login",
+            f"{base}{prefix}/",
+            f"{base}/api/health",
+            f"{base}/login",
+            f"{base}/",
+        ]
+        if "grafana" not in image:
+            urls = [
+                f"{base}{prefix}/",
+                f"{base}{prefix}/login",
+                f"{base}/",
+                f"{base}/login",
+            ]
+    # 순서 유지하면서 중복 제거
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def _wait_until_ready(
+    port: int,
+    workspace: Workspace | None = None,
+    container=None,
+    *,
+    inner_port: int | None = None,
+    timeout: int | None = None,
+) -> None:
+    wait_for = int(timeout or settings.ready_timeout_seconds)
+    kind = ((workspace.kind if workspace is not None else "") or "").strip().lower()
+    if timeout is None and kind == "web":
+        wait_for = max(wait_for, 180)
+    deadline = time.time() + wait_for
+    urls = _ready_probe_urls(port, workspace)
+    url = urls[0]
+    if workspace is not None:
+        hint = f"준비 확인: {url}"
+        if inner_port:
+            hint += f" (컨테이너 내부 http_port={inner_port})"
+        add_progress(workspace.id, hint)
+    last_http = "응답 없음"
+    with httpx.Client(follow_redirects=True, timeout=3.0) as client:
         while time.time() < deadline:
-            try:
-                response = client.get(url)
-                if response.status_code < 500:
-                    return
-            except httpx.HTTPError:
-                time.sleep(0.6)
-    raise TimeoutError("웹 화면이 준비되지 않았습니다.")
+            if container is not None:
+                try:
+                    container.reload()
+                    state = ((container.attrs or {}).get("State") or {})
+                    status = (state.get("Status") or "").lower()
+                    if status in {"exited", "dead", "oomkilled"}:
+                        exit_code = state.get("ExitCode")
+                        raise RuntimeError(
+                            _format_web_ready_failure(
+                                workspace,
+                                container,
+                                url,
+                                inner_port,
+                                last_http=f"컨테이너가 종료됨 (exit {exit_code})",
+                                timeout=wait_for,
+                                crashed=True,
+                            )
+                        )
+                except RuntimeError:
+                    raise
+                except DockerException:
+                    pass
+            ready = False
+            for probe in urls:
+                try:
+                    response = client.get(probe)
+                    last_http = f"{probe} → HTTP {response.status_code}"
+                    if _http_looks_ready(response.status_code):
+                        url = probe
+                        ready = True
+                        break
+                except httpx.HTTPError as exc:
+                    last_http = f"{probe} → {str(exc)[:200]}"
+            if ready:
+                return
+            time.sleep(1.0)
+    raise TimeoutError(
+        _format_web_ready_failure(
+            workspace,
+            container,
+            url,
+            inner_port,
+            last_http=last_http,
+            timeout=wait_for,
+        )
+    )
 
 
 def _json_package_list(raw: str | None) -> list[str]:
@@ -884,7 +1057,7 @@ def start_workspace(db: Session, workspace: Workspace, *, prepare_python: bool =
                 if not port:
                     raise RuntimeError("호스트 포트를 할당하지 못했습니다.")
                 add_progress(workspace.id, f"code-server 대기 중 (port {port})")
-                _wait_until_ready(port)
+                _wait_until_ready(port, workspace, container, inner_port=8080)
                 add_progress(workspace.id, "code-server 준비됨")
                 _ensure_vscode_dark_theme(container)
                 add_progress(workspace.id, "Python 환경 구성 시작")
@@ -895,8 +1068,13 @@ def start_workspace(db: Session, workspace: Workspace, *, prepare_python: bool =
                 port = _host_port(container, workspace)
                 if not port:
                     raise RuntimeError("호스트 포트를 할당하지 못했습니다.")
-                add_progress(workspace.id, f"웹 UI 대기 중 (port {port})")
-                _wait_until_ready(port)
+                add_progress(workspace.id, f"웹 UI 대기 중 (host port {port})")
+                _wait_until_ready(
+                    port,
+                    workspace,
+                    container,
+                    inner_port=int(workspace.http_port or 80),
+                )
                 add_progress(workspace.id, "웹 UI 준비됨")
                 workspace.host_port = port
             else:

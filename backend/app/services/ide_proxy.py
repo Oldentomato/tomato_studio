@@ -12,6 +12,7 @@ from starlette.responses import Response, StreamingResponse
 
 from ..models import Workspace
 from . import docker_ws
+from .specs import uses_subpath_proxy
 
 _HOP = {
     "connection",
@@ -32,6 +33,7 @@ _HTML_ATTR = re.compile(
 )
 _HTML_HEAD = re.compile(r"(<head[^>]*>)", re.I)
 _COOKIE_DOMAIN = re.compile(r";\s*Domain=[^;]*", re.I)
+_COOKIE_PATH = re.compile(r";\s*Path=([^;]*)", re.I)
 _FRAME_ANCESTORS = re.compile(r"frame-ancestors[^;]*;?", re.I)
 
 _client = httpx.AsyncClient(
@@ -55,27 +57,53 @@ def _prefix(workspace_id: str, mode: str = "ide") -> str:
     return f"/api/workspaces/{workspace_id}/{suffix}"
 
 
-def _target_url(host: str, port: int, path: str, query: str) -> str:
-    rel = path.lstrip("/")
-    url = f"http://{host}:{port}/{rel}"
+def _uses_subpath(workspace: Workspace, mode: str) -> bool:
+    return mode == "web" and uses_subpath_proxy(workspace.docker_image or "")
+
+
+def _public_host(headers, fallback: str = "") -> str:
+    return (headers.get("host") or fallback).strip()
+
+
+def _join_upstream(host: str, port: int, path: str, query: str) -> str:
+    if not path.startswith("/"):
+        path = f"/{path}"
+    url = f"http://{host}:{port}{path}"
     if query:
         url = f"{url}?{query}"
     return url
 
 
-def _filter_request_headers(
-    headers: dict[str, str],
+def _target_url(
     host: str,
     port: int,
+    path: str,
+    query: str,
+    *,
+    prefix: str,
+    full_prefix: bool,
+) -> str:
+    rel = path.lstrip("/")
+    if full_prefix:
+        base = prefix.rstrip("/")
+        forwarded = f"{base}/{rel}" if rel else f"{base}/"
+        return _join_upstream(host, port, forwarded, query)
+    return _join_upstream(host, port, f"/{rel}" if rel else "/", query)
+
+
+def _filter_request_headers(
+    headers: dict[str, str],
     request: Request,
     prefix: str,
     mode: str,
 ) -> dict[str, str]:
     out = {k: v for k, v in headers.items() if k.lower() not in _HOP}
-    out["host"] = f"{host}:{port}"
+    public_host = _public_host(request.headers, request.url.netloc)
+    # Keep the browser Host so CSRF Origin checks match. TCP still goes to the container.
+    out["host"] = public_host
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     out["x-forwarded-proto"] = proto
-    out["x-forwarded-host"] = request.headers.get("host") or request.url.hostname or ""
+    out["x-forwarded-host"] = public_host
     out["x-forwarded-for"] = request.headers.get("x-forwarded-for") or (request.client.host if request.client else "")
     if mode == "web":
         out["x-forwarded-prefix"] = prefix
@@ -84,21 +112,45 @@ def _filter_request_headers(
     return out
 
 
-def _rewrite_location(value: str, prefix: str, origin: str) -> str:
+def _path_from_location(value: str, origin: str) -> str:
     if value.startswith(origin):
-        rest = value[len(origin) :]
+        rest = value[len(origin) :] or "/"
         if not rest.startswith("/"):
             rest = f"/{rest}"
-        return f"{prefix}{rest}"
+        return rest
     parsed = urlsplit(value)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         rest = parsed.path or "/"
         if parsed.query:
             rest = f"{rest}?{parsed.query}"
-        return f"{prefix}{rest}"
-    if value.startswith("/") and not value.startswith(prefix):
-        return f"{prefix}{value}"
+        return rest
     return value
+
+
+def _rewrite_location(value: str, prefix: str, origin: str) -> str:
+    prefix_n = prefix.rstrip("/")
+    path = _path_from_location(value, origin)
+    if path == prefix_n or path.startswith(f"{prefix_n}/") or path.startswith(f"{prefix_n}?"):
+        return path
+    if path.startswith("/"):
+        return f"{prefix_n}{path}"
+    return value
+
+
+def _same_proxy_path(left: str, right: str) -> bool:
+    return left.rstrip("/") == right.rstrip("/")
+
+
+def _rewrite_cookie(value: str, prefix: str) -> str:
+    cookie = _COOKIE_DOMAIN.sub("", value)
+    prefix_path = prefix.rstrip("/") + "/"
+    match = _COOKIE_PATH.search(cookie)
+    if match:
+        current = (match.group(1) or "").strip()
+        if current.rstrip("/") == prefix.rstrip("/") or current.startswith(prefix.rstrip("/")):
+            return cookie
+        return _COOKIE_PATH.sub(f"; Path={prefix_path}", cookie, count=1)
+    return f"{cookie}; Path={prefix_path}"
 
 
 def _rewrite_html(html: str, prefix: str) -> str:
@@ -128,10 +180,7 @@ def _response_headers(
             headers.append((key, _rewrite_location(value, prefix, origin)))
             continue
         if lower == "set-cookie":
-            cookie = value.replace("Path=/", f"Path={prefix}/", 1)
-            if mode == "web":
-                cookie = _COOKIE_DOMAIN.sub("", cookie)
-            headers.append((key, cookie))
+            headers.append((key, _rewrite_cookie(value, prefix)))
             continue
         if mode == "web" and lower == "x-frame-options":
             continue
@@ -156,13 +205,22 @@ async def proxy_http(
     host, port = _upstream(workspace)
     origin = f"http://{host}:{port}"
     prefix = _prefix(workspace_id, mode)
-    url = _target_url(host, port, path, request.url.query)
-    headers = _filter_request_headers(dict(request.headers), host, port, request, prefix, mode)
+    full_prefix = _uses_subpath(workspace, mode)
+    url = _target_url(
+        host,
+        port,
+        path,
+        request.url.query,
+        prefix=prefix,
+        full_prefix=full_prefix,
+    )
+    headers = _filter_request_headers(dict(request.headers), request, prefix, mode)
     body = await request.body()
     req = _client.build_request(request.method, url, headers=headers, content=body or None)
+    req.headers["host"] = headers["host"]
     upstream = await _client.send(req, stream=True)
     content_type = (upstream.headers.get("content-type") or "").lower()
-    rewrite_html = mode == "web" and "text/html" in content_type
+    rewrite_html = mode == "web" and not full_prefix and "text/html" in content_type
 
     if rewrite_html:
         raw = await upstream.aread()
@@ -182,6 +240,8 @@ async def proxy_http(
         out_headers = _response_headers(upstream, prefix, origin, mode=mode, drop_encoding=True)
         response = Response(content=payload, status_code=upstream.status_code)
         for key, value in out_headers:
+            if key.lower() == "location" and _same_proxy_path(value, request.url.path):
+                continue
             response.headers.append(key, value)
         return response
 
@@ -196,6 +256,8 @@ async def proxy_http(
 
     response = StreamingResponse(stream(), status_code=upstream.status_code)
     for key, value in out_headers:
+        if key.lower() == "location" and _same_proxy_path(value, request.url.path):
+            continue
         response.headers.append(key, value)
     return response
 
@@ -218,8 +280,15 @@ async def proxy_ws(
         return
 
     query = websocket.url.query
+    prefix = _prefix(workspace_id, mode)
+    full_prefix = _uses_subpath(workspace, mode)
     rel = path.lstrip("/")
-    url = f"ws://{host}:{port}/{rel}"
+    if full_prefix:
+        base = prefix.rstrip("/")
+        forwarded = f"{base}/{rel}" if rel else f"{base}/"
+        url = f"ws://{host}:{port}{forwarded}"
+    else:
+        url = f"ws://{host}:{port}/{rel}"
     if query:
         url = f"{url}?{query}"
 
@@ -237,9 +306,16 @@ async def proxy_ws(
             "content-length",
         }
     }
-    headers["host"] = f"{host}:{port}"
+    public_host = _public_host(websocket.headers, websocket.url.netloc)
+    headers["host"] = public_host
+    proto = websocket.headers.get("x-forwarded-proto") or websocket.url.scheme
+    if proto == "ws":
+        proto = "http"
+    elif proto == "wss":
+        proto = "https"
+    headers["x-forwarded-proto"] = proto
+    headers["x-forwarded-host"] = public_host
     if mode == "web":
-        prefix = _prefix(workspace_id, mode)
         headers["x-forwarded-prefix"] = prefix
         headers["x-script-name"] = prefix
     subprotocol = websocket.headers.get("sec-websocket-protocol")

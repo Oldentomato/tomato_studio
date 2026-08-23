@@ -160,6 +160,11 @@ export default function Studio() {
       <div className="studio-layout">
         <AgentChat
           selectedWorkspace={workspaces.find((item) => item.id === selectedId) ?? null}
+          onReset={() => {
+            setSpec(null);
+            setSelectedId(null);
+            setError(null);
+          }}
           onResult={onAgentResult}
           onProgress={(partial) => {
             if (partial.spec) setSpec(partial.spec);
@@ -173,6 +178,7 @@ export default function Studio() {
         />
         <div className="studio-side">
           <SpecPanel
+            key={spec?.id ?? "empty"}
             spec={spec}
             onCreated={(workspace) => {
               setSpec((current) =>

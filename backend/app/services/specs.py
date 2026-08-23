@@ -393,6 +393,11 @@ def web_compat_env(image: str, prefix: str) -> dict[str, str]:
     return {}
 
 
+def uses_subpath_proxy(image: str) -> bool:
+    """ROOT_URL/basepath env를 넣는 앱은 프록시가 접두 경로를 그대로 전달해야 한다."""
+    return bool(web_compat_env(image, "/api/workspaces/_/ui"))
+
+
 # bash/sh만 있고 데몬이 없어서 바로 종료되는 OS/언어 이미지
 KEEP_ALIVE_IMAGES = {
     "ubuntu",

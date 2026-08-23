@@ -543,6 +543,13 @@ h1 {
   background: var(--surface);
 }
 
+.chat-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .chat-head p,
 .chat-head h2,
 .spec-head h2,

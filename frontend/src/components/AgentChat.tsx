@@ -6,10 +6,16 @@ const STORAGE_KEY = "tomato.conversation_id";
 type Props = {
   onResult: (result: ChatOut) => void;
   onProgress: (result: Partial<ChatOut>) => void;
+  onReset?: () => void;
   selectedWorkspace?: Workspace | null;
 };
 
-export default function AgentChat({ onResult, onProgress, selectedWorkspace = null }: Props) {
+export default function AgentChat({
+  onResult,
+  onProgress,
+  onReset,
+  selectedWorkspace = null,
+}: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
@@ -76,20 +82,36 @@ export default function AgentChat({ onResult, onProgress, selectedWorkspace = nu
     }
   }
 
+  function resetSession() {
+    if (pending) return;
+    localStorage.removeItem(STORAGE_KEY);
+    setConversationId(null);
+    setMessages([]);
+    setInput("");
+    setError(null);
+    setLiveTools([]);
+    onReset?.();
+  }
+
   return (
     <section className="chat-panel">
       <div className="chat-head">
-        <h2>에이전트</h2>
-        {selectedWorkspace ? (
-          <p>
-            선택: {selectedWorkspace.name}
-            {selectedWorkspace.status === "error"
-              ? " · 오류 카드를 고쳤어요. 수정해 달라고 하면 사양서를 고치고 다시 적용합니다."
-              : " · 이 워크스페이스를 기준으로 답합니다."}
-          </p>
-        ) : (
-          <p>사양서를 먼저 보여 줍니다. 컨테이너는 오른쪽 버튼으로만 만듭니다.</p>
-        )}
+        <div>
+          <h2>에이전트</h2>
+          {selectedWorkspace ? (
+            <p>
+              선택: {selectedWorkspace.name}
+              {selectedWorkspace.status === "error"
+                ? " · 오류 카드를 고쳤어요. 수정해 달라고 하면 사양서를 고치고 다시 적용합니다."
+                : " · 이 워크스페이스를 기준으로 답합니다."}
+            </p>
+          ) : (
+            <p>사양서를 먼저 보여 줍니다. 컨테이너는 오른쪽 버튼으로만 만듭니다.</p>
+          )}
+        </div>
+        <button type="button" className="ghost compact" onClick={resetSession} disabled={pending}>
+          초기화
+        </button>
       </div>
       <div className="chat-log" ref={scroller}>
         {messages.length === 0 ? (
